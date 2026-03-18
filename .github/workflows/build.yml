@@ -85,6 +85,7 @@ jobs:
         run: python -m build --wheel
 
       - name: Retag wheel with platform
+        shell: bash
         env:
           WHEEL_PLAT: ${{ matrix.wheel_plat }}
         run: |
