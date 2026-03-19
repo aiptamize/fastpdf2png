@@ -330,7 +330,7 @@ int RunDaemon() {
     if (ntok >= 3 && std::string_view{tokens[0]} == "RENDER") {
       const auto* pdf = tokens[1];
       const auto* pat = tokens[2];
-      const auto dpi = (ntok >= 4) ? static_cast<float>(std::atof(tokens[3])) : 300.0f;
+      const auto dpi = (ntok >= 4) ? static_cast<float>(std::atof(tokens[3])) : 150.0f;
       const auto workers = (ntok >= 5) ? std::atoi(tokens[4]) : 1;
       const auto comp = (ntok >= 6) ? std::atoi(tokens[5]) : 2;
 
@@ -395,7 +395,7 @@ int main(int argc, char* argv[]) {
         "  %s --info input.pdf\n"
         "  %s --daemon\n\n"
         "Options:\n"
-        "  dpi       Resolution (default: 300)\n"
+        "  dpi       Resolution (default: 150)\n"
         "  workers   Parallel workers (default: 1)\n"
         "  -c level  0=fast, 1=medium, 2=best (default: 2)\n",
         argv[0], argv[0], argv[0]);
@@ -404,7 +404,7 @@ int main(int argc, char* argv[]) {
 
   const auto* pdf_path = argv[1];
   const auto* pattern = argv[2];
-  const auto dpi = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 300.0f;
+  const auto dpi = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 150.0f;
   auto workers = (argc > 4) ? std::atoi(argv[4]) : 1;
   auto compression = 2;
 
