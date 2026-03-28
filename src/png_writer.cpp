@@ -505,7 +505,7 @@ int WriteRgba(const char* filename, const uint8_t* pixels,
   if (compression_level == kCompressBest)
     return EncodeLibdeflateRgba(filename, pixels, width, height, stride);
 
-  // fpng natively accepts RGBA — feed directly, NO conversion needed
+  // fpng path — init only when needed
   EnsureFpngInit();
   int flags = (compression_level >= kCompressMedium) ? fpng::FPNG_ENCODE_SLOWER : 0;
   return fpng::fpng_encode_image_to_file(filename, pixels, width, height, 4, flags)
@@ -518,8 +518,35 @@ int WriteRgbaToMemory(const uint8_t* pixels, int width, int height,
   if (!pixels || width <= 0 || height <= 0 || !out_data || !out_size)
     return kErrorInvalidParams;
 
-  // For kCompressBest, use libdeflate with RGBA-native path
-  // For fpng: feed RGBA directly, no conversion
+  if (compression_level == kCompressBest) {
+    // Use RGBA-native libdeflate path with grayscale detection
+    const bool gray = IsImageGrayscale(pixels, width, height, stride);
+    const int color_type = gray ? 0 : 2;
+    const size_t row_bytes = 1 + static_cast<size_t>(width) * (gray ? 1 : 3);
+    const size_t raw_size = row_bytes * height;
+
+    auto& bufs = GetBuffers();
+    auto* raw = bufs.AcquireRaw(raw_size);
+    if (!raw) return kErrorAllocFailed;
+
+    if (gray) PrepareGrayscaleRgba(raw, pixels, width, height, stride);
+    else      PrepareRgbFromRgba(raw, pixels, width, height, stride);
+
+    auto* c = GetCompressor();
+    if (!c) return kErrorAllocFailed;
+
+    const size_t bound = libdeflate_zlib_compress_bound(c, raw_size);
+    const size_t total = kHeaderSize + bound + kTrailerSize;
+    *out_data = static_cast<uint8_t*>(std::malloc(total));
+    if (!*out_data) { *out_size = 0; return kErrorAllocFailed; }
+
+    const size_t comp = libdeflate_zlib_compress(c, raw, raw_size, *out_data + kHeaderSize, bound);
+    if (comp == 0) { std::free(*out_data); *out_data = nullptr; *out_size = 0; return kErrorCompressFailed; }
+
+    *out_size = AssemblePng(*out_data, width, height, comp, color_type);
+    return kSuccess;
+  }
+
   EnsureFpngInit();
   int flags = (compression_level >= kCompressMedium) ? fpng::FPNG_ENCODE_SLOWER : 0;
   std::vector<uint8_t> buf;

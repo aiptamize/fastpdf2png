@@ -109,6 +109,61 @@ def to_bytes(pdf: Union[str, Path], dpi: int = 150, workers: int = None) -> List
         return [f.read_bytes() for f in files]
 
 
+def to_raw(pdf: Union[str, Path], dpi: int = 150, workers: int = None) -> list:
+    """
+    Convert a PDF to raw RGBA pixel buffers in memory.
+    No PNG encoding, no disk I/O — maximum speed.
+
+    Args:
+        pdf: Path to the PDF file.
+        dpi: Resolution (default 150).
+        workers: Parallel worker processes (default: auto, max 4).
+
+    Returns:
+        List of dicts with keys: 'data' (bytes), 'width', 'height', 'stride', 'channels'.
+        Pixel format is RGBA (4 bytes per pixel).
+
+    Example:
+        pages = fastpdf2png.to_raw("report.pdf", dpi=150)
+        # Feed to GPU, numpy, OpenCV, etc.
+        import numpy as np
+        arr = np.frombuffer(pages[0]['data'], dtype=np.uint8).reshape(
+            pages[0]['height'], pages[0]['stride'] // pages[0]['channels'], pages[0]['channels'])
+    """
+    import struct
+
+    binary = _find_binary()
+    pdf = Path(pdf).resolve()
+    if not pdf.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf}")
+
+    def _read_raw_stdout(proc):
+        """Read PixelHeader + RGBA pixels from a --raw process."""
+        result = []
+        hdr_size = 16
+        while True:
+            hdr_bytes = proc.stdout.read(hdr_size)
+            if len(hdr_bytes) < hdr_size:
+                break
+            width, height, stride, channels = struct.unpack('iiii', hdr_bytes)
+            data = proc.stdout.read(stride * height)
+            if len(data) < stride * height:
+                break
+            result.append({
+                'data': data, 'width': width, 'height': height,
+                'stride': stride, 'channels': channels,
+            })
+        proc.wait()
+        return result
+
+    # --raw streams PixelHeader + RGBA pixels to stdout. No disk I/O.
+    proc = subprocess.Popen(
+        [str(binary), "--raw", str(pdf), str(dpi)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    return _read_raw_stdout(proc)
+
+
 def page_count(pdf: Union[str, Path]) -> int:
     """
     Get the number of pages in a PDF (instant, no rendering).

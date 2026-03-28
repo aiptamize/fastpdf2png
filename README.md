@@ -33,9 +33,15 @@ bash scripts/build.sh
 # Single PDF
 ./build/fastpdf2png input.pdf page_%03d.png 150 8 -c 2
 
+# Disable anti-aliasing for ~80% more throughput
+./build/fastpdf2png input.pdf page_%03d.png 150 8 -c 2 --no-aa
+
 # Streaming pool — many PDFs, max throughput
 for f in docs/*.pdf; do echo "$f\toutput/${f%.pdf}_%03d.png"; done | \
   ./build/fastpdf2png --pool 150 8 -c 2
+
+# Raw RGBA pixels to stdout (zero disk I/O, zero encoding)
+./build/fastpdf2png --raw input.pdf 150
 ```
 
 ### Python
@@ -47,6 +53,7 @@ import fastpdf2png
 images = fastpdf2png.to_images("doc.pdf")           # list of PIL images
 files  = fastpdf2png.to_files("doc.pdf", "output/")  # save PNGs to disk
 data   = fastpdf2png.to_bytes("doc.pdf")             # raw PNG bytes
+raw    = fastpdf2png.to_raw("doc.pdf")               # raw RGBA pixel buffers
 n      = fastpdf2png.page_count("doc.pdf")           # page count
 
 # Many files — streaming worker pool, max throughput
@@ -57,6 +64,21 @@ with fastpdf2png.Engine(workers=8) as eng:
     eng.to_files("single.pdf", "output/")
     imgs = eng.to_images("single.pdf", dpi=72)
     n    = eng.page_count("single.pdf")
+```
+
+#### Native C library binding (zero-copy)
+
+```python
+from fastpdf2png.native import render, render_many, page_count
+
+# Single PDF — raw RGBA pixel buffers, no PNG encoding
+pages = render("doc.pdf", dpi=150)
+for page in pages:
+    arr = page.to_numpy()   # (H, W, 4) RGBA numpy array
+    img = page.to_pil()     # PIL Image (RGB)
+
+# Many PDFs in parallel
+results = render_many(pdf_paths, dpi=150, workers=8)
 ```
 
 ### Node.js
@@ -74,24 +96,53 @@ await engine.toFiles("doc.pdf", "output/");
 engine.close();
 ```
 
+### C++ native library
+
+```cpp
+#include "fastpdf2png/lib.h"
+
+fpdf2png::Engine engine;
+
+// Render all pages to raw RGBA pixels
+auto result = engine.render("doc.pdf", {.dpi = 150});
+if (result) {
+    for (auto& page : *result) {
+        // page.data.get() — raw RGBA pixels
+        // page.width, page.height, page.stride
+        auto pixels = page.pixels();  // std::span<const uint8_t>
+    }
+}
+
+// Render from memory
+auto result = engine.render({pdf_data.data(), pdf_data.size()});
+
+// Render specific page range [start, end)
+auto result = engine.render_pages("doc.pdf", 0, 10);
+
+// Get page count without rendering
+int n = engine.page_count("doc.pdf");
+```
+
 ## Performance
 
-Worker scaling on a single 103-page PDF (150 DPI, compression level 2, Apple M-series):
+Single 103-page text PDF (150 DPI, compression level 2, Apple M-series):
 
 | Workers | Pages/sec |
 |---------|-----------|
-| 1 | 141 |
-| 2 | 309 |
-| 4 | 555 |
-| 8 | **894** |
+| 1 | 165 |
+| 2 | 317 |
+| 4 | 546 |
+| 8 | **931** |
 
-Streaming pool mode — 200 separate PDFs (324 total pages, 150 DPI, 8 workers):
+Streaming pool mode — 200 separate PDFs (324 total pages, 8 workers):
 
-| DPI | Pages/sec |
-|-----|-----------|
-| 72 | **574** |
-| 150 | **316** |
-| 300 | 101 |
+| DPI | AA on | AA off |
+|-----|-------|--------|
+| 72 | 446 | **537** |
+| 150 | 189 | **334** |
+| 300 | 119 | 121 |
+
+Speed depends on page content complexity. Simple text pages render at 165 pg/s per core; pages with images and graphics render at 15-28 pg/s per core.
 
 Smaller output files for grayscale pages thanks to automatic grayscale detection.
 
@@ -107,7 +158,7 @@ Google's [PDFium](https://pdfium.googlesource.com/pdfium/) (the engine inside Ch
 
 ### Grayscale detection
 
-Before encoding, a SIMD-accelerated pass scans every pixel to check if R == G == B. Most document pages (text, tables, charts) are grayscale — detecting this lets us encode them as 8-bit PNG instead of 24-bit RGB, cutting data size by 66% with zero quality loss. On ARM this uses NEON `vld4/vceq` intrinsics; on x86 it uses SSE/AVX2.
+Before encoding, a SIMD-accelerated pass scans every pixel to check if R == G == B. Grayscale pages are encoded as 8-bit PNG instead of 24-bit RGB, cutting data size by 66% with zero quality loss. On ARM this uses NEON `vld4/vceq` intrinsics; on x86 it uses SSE/AVX2.
 
 ### PNG encoding
 
@@ -115,7 +166,7 @@ Instead of the standard zlib/libpng pipeline, we use [libdeflate](https://github
 
 ### Pool mode
 
-The `--pool` command pre-forks N worker processes at startup. Workers stay alive and wait for jobs on pipes (zero CPU waste when idle). The parent reads PDF paths from stdin and dispatches them immediately to workers via pipe IPC. Large multi-page PDFs are automatically split into page ranges across workers for load balancing. Each worker loads PDFs into memory with `read()` and parses them with `FPDF_LoadMemDocument64`, eliminating syscalls during PDF parsing.
+The `--pool` command pre-forks N worker processes at startup. Workers stay alive and wait for jobs on pipes (zero CPU waste when idle). The parent reads PDF paths from stdin and dispatches them immediately to workers via pipe IPC. Large multi-page PDFs are automatically split into page ranges across workers for load balancing. Each worker caches the last-opened document to avoid re-parsing for split page ranges.
 
 On Windows, pool mode uses `CreateProcess` with anonymous pipes — same architecture, Win32 APIs.
 
@@ -126,8 +177,9 @@ Each worker maintains process-local memory pools for pixel buffers and compressi
 ## CLI reference
 
 ```
-fastpdf2png <input.pdf> <output_%03d.png> [dpi] [workers] [-c level]
-fastpdf2png --pool [dpi] [workers] [-c level]    < job_list
+fastpdf2png <input.pdf> <output_%03d.png> [dpi] [workers] [-c level] [--no-aa]
+fastpdf2png --pool [dpi] [workers] [-c level] [--no-aa]    < job_list
+fastpdf2png --raw <input.pdf> [dpi] [--no-aa]
 fastpdf2png --info <input.pdf>
 fastpdf2png --daemon
 ```
@@ -140,7 +192,9 @@ fastpdf2png --daemon
 | `-c 0` | | Fast PNG (fpng) |
 | `-c 1` | | Medium PNG (fpng slower) |
 | `-c 2` | 2 | Best PNG (libdeflate, smallest files) |
+| `--no-aa` | | Disable anti-aliasing (faster rendering) |
 | `--pool` | | Streaming worker pool (reads jobs from stdin) |
+| `--raw` | | Output raw RGBA pixels to stdout (no encoding) |
 | `--info` | | Print page count |
 | `--daemon` | | Persistent mode (stdin commands) |
 

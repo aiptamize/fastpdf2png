@@ -83,8 +83,11 @@ void InitPdfium() {
 // Page rendering
 // ---------------------------------------------------------------------------
 
+constexpr int kNoAA = FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHIMAGE |
+                      FPDF_RENDER_NO_SMOOTHPATH;
+
 bool RenderPage(FPDF_DOCUMENT doc, int page_idx, float dpi,
-                const char* pattern, int compression) {
+                const char* pattern, int compression, bool no_aa = false) {
   auto* page = FPDF_LoadPage(doc, page_idx);
   if (!page) return false;
 
@@ -107,11 +110,10 @@ bool RenderPage(FPDF_DOCUMENT doc, int page_idx, float dpi,
   auto* bitmap = FPDFBitmap_CreateEx(width, height, FPDFBitmap_BGRx, buffer, stride);
   if (!bitmap) { FPDF_ClosePage(page); return false; }
 
+  int flags = FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER;
+  if (no_aa) flags |= kNoAA;
   FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xFFFFFFFF);
-  FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0,
-                        FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER |
-                        FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHIMAGE |
-                        FPDF_RENDER_NO_SMOOTHPATH);
+  FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, flags);
 
   char path[4096];
   std::snprintf(path, sizeof(path), pattern, page_idx + 1);
@@ -128,13 +130,13 @@ bool RenderPage(FPDF_DOCUMENT doc, int page_idx, float dpi,
 // ---------------------------------------------------------------------------
 
 int RenderSingle(const char* pdf_path, float dpi, const char* pattern,
-                 int pages, int compression) {
+                 int pages, int compression, bool no_aa = false) {
   auto* doc = FPDF_LoadDocument(pdf_path, nullptr);
   if (!doc) { std::fprintf(stderr, "Failed to open: %s\n", pdf_path); return 1; }
 
   int rendered = 0;
   for (int i = 0; i < pages; ++i) {
-    if (RenderPage(doc, i, dpi, pattern, compression))
+    if (RenderPage(doc, i, dpi, pattern, compression, no_aa))
       ++rendered;
   }
 
@@ -148,14 +150,14 @@ int RenderSingle(const char* pdf_path, float dpi, const char* pattern,
 
 #ifndef _WIN32
 [[noreturn]] void WorkerLoop(const char* pdf_path, float dpi, const char* pattern,
-                             int compression, SharedState* shared) {
+                             int compression, SharedState* shared, bool no_aa = false) {
   auto* doc = FPDF_LoadDocument(pdf_path, nullptr);
   if (!doc) std::exit(1);
 
   while (true) {
     const auto page = ClaimNextPage(shared);
     if (page >= shared->total_pages) break;
-    if (RenderPage(doc, page, dpi, pattern, compression))
+    if (RenderPage(doc, page, dpi, pattern, compression, no_aa))
       MarkCompleted(shared);
   }
 
@@ -164,7 +166,7 @@ int RenderSingle(const char* pdf_path, float dpi, const char* pattern,
 }
 
 int RenderMulti(const char* pdf_path, float dpi, const char* pattern,
-                int pages, int workers, int compression) {
+                int pages, int workers, int compression, bool no_aa = false) {
   auto* shared = static_cast<SharedState*>(
       mmap(nullptr, sizeof(SharedState), PROT_READ | PROT_WRITE,
            MAP_SHARED | MAP_ANONYMOUS, -1, 0));
@@ -179,7 +181,7 @@ int RenderMulti(const char* pdf_path, float dpi, const char* pattern,
 
   for (int i = 0; i < workers; ++i) {
     if (auto pid = fork(); pid == 0)
-      WorkerLoop(pdf_path, dpi, pattern, compression, shared);
+      WorkerLoop(pdf_path, dpi, pattern, compression, shared, no_aa);
     else if (pid > 0)
       children.push_back(pid);
   }
@@ -199,7 +201,7 @@ int RenderMulti(const char* pdf_path, float dpi, const char* pattern,
 
 #ifdef _WIN32
 int RunWindowsWorker(const char* pdf_path, float dpi, const char* pattern,
-                     int compression, const char* shm_name) {
+                     int compression, const char* shm_name, bool no_aa = false) {
   InitPdfium();
 
   auto hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, shm_name);
@@ -224,7 +226,7 @@ int RunWindowsWorker(const char* pdf_path, float dpi, const char* pattern,
   while (true) {
     const auto page = ClaimNextPage(shared);
     if (page >= shared->total_pages) break;
-    if (RenderPage(doc, page, dpi, pattern, compression))
+    if (RenderPage(doc, page, dpi, pattern, compression, no_aa))
       MarkCompleted(shared);
   }
 
@@ -236,7 +238,7 @@ int RunWindowsWorker(const char* pdf_path, float dpi, const char* pattern,
 }
 
 int RenderMulti(const char* pdf_path, float dpi, const char* pattern,
-                int pages, int workers, int compression) {
+                int pages, int workers, int compression, bool no_aa = false) {
   char shm_name[64];
   std::snprintf(shm_name, sizeof(shm_name), "fastpdf2png_%lu",
                 static_cast<unsigned long>(GetCurrentProcessId()));
@@ -267,8 +269,9 @@ int RenderMulti(const char* pdf_path, float dpi, const char* pattern,
   for (int i = 0; i < workers; ++i) {
     char cmdline[8192];
     std::snprintf(cmdline, sizeof(cmdline),
-                  "\"%s\" --worker \"%s\" \"%s\" %d %d \"%s\"",
-                  exe_path, pdf_path, pattern, dpi_x10, compression, shm_name);
+                  "\"%s\" --worker \"%s\" \"%s\" %d %d \"%s\" %d",
+                  exe_path, pdf_path, pattern, dpi_x10, compression, shm_name,
+                  no_aa ? 1 : 0);
 
     STARTUPINFOA si{};
     si.cb = sizeof(si);
@@ -369,15 +372,24 @@ int RunDaemon() {
 
 struct PipeJob {
   char pdf_path[512];
-  char output_pattern[512];
+  char output_pattern[512];  // empty = return raw pixels via pipe
   float dpi;
   int compression;
   int page_start;   // -1 = all pages, >= 0 = start page
   int page_end;     // exclusive end
+  int no_aa;        // 1 = disable anti-aliasing for speed
 };
 
 struct PipeResult {
   int pages_rendered;
+};
+
+// Header sent before raw pixel data in memory mode
+struct PixelHeader {
+  int32_t width;
+  int32_t height;
+  int32_t stride;
+  int32_t channels;  // 1 = grayscale, 3 = RGB, 4 = RGBA
 };
 
 #ifndef _WIN32
@@ -432,43 +444,95 @@ bool WriteFull(int fd, const void* buf, size_t count) {
 
 [[noreturn]] void PoolWorkerLoop(int cmd_fd, int result_fd) {
   // Worker inherits PDFium from parent via fork() — font caches warm
+
+  // Cache last-loaded PDF to avoid re-reading for split page ranges
+  char cached_path[512] = {};
+  uint8_t* cached_data = nullptr;
+  size_t cached_size = 0;
+  FPDF_DOCUMENT cached_doc = nullptr;
+
   PipeJob job;
   while (true) {
-    // Block until parent sends a full job (zero CPU waste)
     if (!ReadFull(cmd_fd, &job, sizeof(job))) break;
 
-    // Read PDF into memory, use FPDF_LoadMemDocument64 (zero syscalls during parse)
-    size_t file_size = 0;
-    auto* file_data = ReadFileToMemory(job.pdf_path, file_size);
+    // Reuse cached doc if same PDF (common for split page ranges)
+    FPDF_DOCUMENT doc;
+    if (cached_doc && std::strcmp(job.pdf_path, cached_path) == 0) {
+      doc = cached_doc;
+    } else {
+      // Close previous cached doc
+      if (cached_doc) FPDF_CloseDocument(cached_doc);
+      std::free(cached_data);
 
-    FPDF_DOCUMENT doc = nullptr;
-    if (file_data)
-      doc = FPDF_LoadMemDocument64(file_data, file_size, nullptr);
+      cached_data = ReadFileToMemory(job.pdf_path, cached_size);
+      doc = cached_data ? FPDF_LoadMemDocument64(cached_data, cached_size, nullptr) : nullptr;
+      cached_doc = doc;
+      std::strncpy(cached_path, job.pdf_path, sizeof(cached_path) - 1);
+    }
 
+    const bool memory_mode = (job.output_pattern[0] == '\0');
     PipeResult result{0};
+
     if (doc) {
       const int p_start = (job.page_start >= 0) ? job.page_start : 0;
       const int p_end = (job.page_start >= 0) ? job.page_end : FPDF_GetPageCount(doc);
-      for (int p = p_start; p < p_end; ++p) {
-        if (RenderPage(doc, p, job.dpi, job.output_pattern, job.compression))
-          ++result.pages_rendered;
-      }
-      FPDF_CloseDocument(doc);
-    }
-    std::free(file_data);
 
-    WriteFull(result_fd, &result, sizeof(result));
+      for (int p = p_start; p < p_end; ++p) {
+        if (memory_mode) {
+          // Memory mode: render + send raw pixels through pipe
+          auto* page = FPDF_LoadPage(doc, p);
+          if (!page) continue;
+
+          const auto scale = job.dpi / kPointsPerInch;
+          const auto w = static_cast<int>(FPDF_GetPageWidth(page) * scale + 0.5f);
+          const auto h = static_cast<int>(FPDF_GetPageHeight(page) * scale + 0.5f);
+          if (w <= 0 || h <= 0) { FPDF_ClosePage(page); continue; }
+
+          const auto stride = (w * 4 + 63) & ~63;
+          const auto buf_size = static_cast<size_t>(stride) * h;
+
+          auto& pool = fast_png::GetProcessLocalPool();
+          auto* buffer = pool.Acquire(buf_size);
+          if (!buffer) { FPDF_ClosePage(page); continue; }
+
+          auto* bitmap = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRx, buffer, stride);
+          if (!bitmap) { FPDF_ClosePage(page); continue; }
+
+          int flags = FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER;
+          if (job.no_aa) flags |= kNoAA;
+          FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);
+          FPDF_RenderPageBitmap(bitmap, page, 0, 0, w, h, 0, flags);
+          FPDFBitmap_Destroy(bitmap);
+          FPDF_ClosePage(page);
+
+          // Send header + raw RGBA pixels
+          PixelHeader hdr{w, h, stride, 4};
+          WriteFull(result_fd, &hdr, sizeof(hdr));
+          WriteFull(result_fd, buffer, buf_size);
+          ++result.pages_rendered;
+        } else {
+          // File mode: render + encode + write to disk
+          if (RenderPage(doc, p, job.dpi, job.output_pattern, job.compression, job.no_aa))
+            ++result.pages_rendered;
+        }
+      }
+    }
+
+    if (!memory_mode)
+      WriteFull(result_fd, &result, sizeof(result));
   }
 
+  if (cached_doc) FPDF_CloseDocument(cached_doc);
+  std::free(cached_data);
   close(cmd_fd);
   close(result_fd);
   FPDF_DestroyLibrary();
   std::exit(0);
 }
 
-constexpr off_t kLargeFileBytes = 200 * 1024;
+constexpr off_t kLargeFileBytes = 500 * 1024;  // split multi-page PDFs > 500KB
 
-int RunPool(int num_workers, float default_dpi, int default_compression) {
+int RunPool(int num_workers, float default_dpi, int default_compression, bool no_aa = false) {
   InitPdfium();
 
   // Per-worker pipe pairs
@@ -533,10 +597,17 @@ int RunPool(int num_workers, float default_dpi, int default_compression) {
     }
   };
 
-  // Send job to a worker, draining results first to prevent deadlock.
+  // Pick the worker with fewest in-flight jobs.
+  auto pick_worker = [&]() -> int {
+    int best = 0;
+    for (int i = 1; i < num_workers; ++i)
+      if (workers[i].in_flight < workers[best].in_flight) best = i;
+    return best;
+  };
+
+  // Send job to a worker.
   auto send_job = [&](int w, const char* pdf, const char* pat,
                        float dpi, int comp, int p_start, int p_end) {
-    drain_results();
     PipeJob job{};
     std::strncpy(job.pdf_path, pdf, sizeof(job.pdf_path) - 1);
     std::strncpy(job.output_pattern, pat, sizeof(job.output_pattern) - 1);
@@ -544,20 +615,15 @@ int RunPool(int num_workers, float default_dpi, int default_compression) {
     job.compression = comp;
     job.page_start = p_start;
     job.page_end = p_end;
+    job.no_aa = no_aa ? 1 : 0;
     WriteFull(workers[w].cmd_fd, &job, sizeof(job));
     workers[w].in_flight++;
     total_jobs++;
   };
 
-  // Pre-read all stdin into a job list (takes <1ms for typical input)
-  struct InputJob {
-    std::string pdf_path;
-    std::string out_pattern;
-    float dpi;
-    int comp;
-  };
-  std::vector<InputJob> input_jobs;
+  const auto t0 = std::chrono::high_resolution_clock::now();
 
+  // Stream: dispatch each job the moment it arrives on stdin
   char line[8192];
   while (std::fgets(line, sizeof(line), stdin)) {
     auto len = std::strlen(line);
@@ -568,53 +634,42 @@ int RunPool(int num_workers, float default_dpi, int default_compression) {
     char* tokens[8];
     const auto ntok = SplitTabs(line, tokens, 8);
 
-    InputJob ij;
-    ij.dpi = default_dpi;
-    ij.comp = default_compression;
+    const char* pdf_path;
+    const char* out_pattern;
+    float dpi = default_dpi;
+    int comp = default_compression;
 
     if (ntok >= 3 && std::string_view{tokens[0]} == "RENDER") {
-      ij.pdf_path = tokens[1];
-      ij.out_pattern = tokens[2];
-      if (ntok >= 4) ij.dpi = static_cast<float>(std::atof(tokens[3]));
-      if (ntok >= 6) ij.comp = std::clamp(std::atoi(tokens[5]), -1, 2);
+      pdf_path = tokens[1];
+      out_pattern = tokens[2];
+      if (ntok >= 4) dpi = static_cast<float>(std::atof(tokens[3]));
+      if (ntok >= 6) comp = std::clamp(std::atoi(tokens[5]), -1, 2);
     } else if (ntok >= 2) {
-      ij.pdf_path = tokens[0];
-      ij.out_pattern = tokens[1];
+      pdf_path = tokens[0];
+      out_pattern = tokens[1];
     } else {
       continue;
     }
-    input_jobs.push_back(std::move(ij));
-  }
 
-  const auto t0 = std::chrono::high_resolution_clock::now();
-
-  // Dispatch all jobs — round-robin across workers
-  int next_worker = 0;
-  for (auto& ij : input_jobs) {
     struct stat st{};
-    ::stat(ij.pdf_path.c_str(), &st);
+    ::stat(pdf_path, &st);
 
     if (st.st_size > kLargeFileBytes) {
-      // Large file — split into page ranges
-      auto* doc = FPDF_LoadDocument(ij.pdf_path.c_str(), nullptr);
+      auto* doc = FPDF_LoadDocument(pdf_path, nullptr);
       if (doc) {
         const int pages = FPDF_GetPageCount(doc);
         FPDF_CloseDocument(doc);
         const int ranges = std::min(pages, num_workers);
         const int per_range = (pages + ranges - 1) / ranges;
         for (int p = 0; p < pages; p += per_range) {
-          send_job(next_worker % num_workers, ij.pdf_path.c_str(),
-                   ij.out_pattern.c_str(), ij.dpi, ij.comp,
-                   p, std::min(p + per_range, pages));
-          next_worker++;
+          send_job(pick_worker(), pdf_path, out_pattern,
+                   dpi, comp, p, std::min(p + per_range, pages));
         }
       } else {
-        send_job(next_worker++ % num_workers, ij.pdf_path.c_str(),
-                 ij.out_pattern.c_str(), ij.dpi, ij.comp, -1, 0);
+        send_job(pick_worker(), pdf_path, out_pattern, dpi, comp, -1, 0);
       }
     } else {
-      send_job(next_worker++ % num_workers, ij.pdf_path.c_str(),
-               ij.out_pattern.c_str(), ij.dpi, ij.comp, -1, 0);
+      send_job(pick_worker(), pdf_path, out_pattern, dpi, comp, -1, 0);
     }
   }
 
@@ -715,7 +770,7 @@ int RunPoolWorkerWin(HANDLE cmd_h, HANDLE result_h) {
       const int p_start = (job.page_start >= 0) ? job.page_start : 0;
       const int p_end = (job.page_start >= 0) ? job.page_end : FPDF_GetPageCount(doc);
       for (int p = p_start; p < p_end; ++p) {
-        if (RenderPage(doc, p, job.dpi, job.output_pattern, job.compression))
+        if (RenderPage(doc, p, job.dpi, job.output_pattern, job.compression, job.no_aa))
           ++result.pages_rendered;
       }
       FPDF_CloseDocument(doc);
@@ -727,9 +782,9 @@ int RunPoolWorkerWin(HANDLE cmd_h, HANDLE result_h) {
   return 0;
 }
 
-constexpr DWORD kWinLargeFileBytes = 200 * 1024;
+constexpr DWORD kWinLargeFileBytes = 500 * 1024;
 
-int RunPoolWin(int num_workers, float default_dpi, int default_compression) {
+int RunPoolWin(int num_workers, float default_dpi, int default_compression, bool no_aa = false) {
   InitPdfium();
 
   char exe_path[MAX_PATH];
@@ -794,20 +849,15 @@ int RunPoolWin(int num_workers, float default_dpi, int default_compression) {
     job.compression = comp;
     job.page_start = p_start;
     job.page_end = p_end;
+    job.no_aa = no_aa ? 1 : 0;
     WriteFullWin(workers[w].cmd_write, &job, sizeof(job));
     workers[w].in_flight++;
     total_jobs++;
   };
 
-  // Pre-read all stdin
-  struct InputJob {
-    std::string pdf_path;
-    std::string out_pattern;
-    float dpi;
-    int comp;
-  };
-  std::vector<InputJob> input_jobs;
+  const auto t0 = std::chrono::high_resolution_clock::now();
 
+  // Stream: dispatch each job the moment it arrives on stdin
   char line[8192];
   while (std::fgets(line, sizeof(line), stdin)) {
     auto len = std::strlen(line);
@@ -818,53 +868,51 @@ int RunPoolWin(int num_workers, float default_dpi, int default_compression) {
     char* tokens[8];
     const auto ntok = SplitTabs(line, tokens, 8);
 
-    InputJob ij;
-    ij.dpi = default_dpi;
-    ij.comp = default_compression;
+    const char* pdf_path;
+    const char* out_pattern;
+    float dpi = default_dpi;
+    int comp = default_compression;
 
     if (ntok >= 3 && std::string_view{tokens[0]} == "RENDER") {
-      ij.pdf_path = tokens[1];
-      ij.out_pattern = tokens[2];
-      if (ntok >= 4) ij.dpi = static_cast<float>(std::atof(tokens[3]));
-      if (ntok >= 6) ij.comp = std::clamp(std::atoi(tokens[5]), -1, 2);
+      pdf_path = tokens[1];
+      out_pattern = tokens[2];
+      if (ntok >= 4) dpi = static_cast<float>(std::atof(tokens[3]));
+      if (ntok >= 6) comp = std::clamp(std::atoi(tokens[5]), -1, 2);
     } else if (ntok >= 2) {
-      ij.pdf_path = tokens[0];
-      ij.out_pattern = tokens[1];
+      pdf_path = tokens[0];
+      out_pattern = tokens[1];
     } else {
       continue;
     }
-    input_jobs.push_back(std::move(ij));
-  }
 
-  const auto t0 = std::chrono::high_resolution_clock::now();
+    // Pick least-loaded worker
+    auto pick_w = [&]() -> int {
+      int best = 0;
+      for (int i = 1; i < num_workers; ++i)
+        if (workers[i].in_flight < workers[best].in_flight) best = i;
+      return best;
+    };
 
-  // Dispatch round-robin, split large PDFs
-  int next_worker = 0;
-  for (auto& ij : input_jobs) {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
-    GetFileAttributesExA(ij.pdf_path.c_str(), GetFileExInfoStandard, &fad);
+    GetFileAttributesExA(pdf_path, GetFileExInfoStandard, &fad);
     DWORD fsize = fad.nFileSizeLow;
 
     if (fsize > kWinLargeFileBytes) {
-      auto* doc = FPDF_LoadDocument(ij.pdf_path.c_str(), nullptr);
+      auto* doc = FPDF_LoadDocument(pdf_path, nullptr);
       if (doc) {
         const int pages = FPDF_GetPageCount(doc);
         FPDF_CloseDocument(doc);
         const int ranges = std::min(pages, num_workers);
         const int per_range = (pages + ranges - 1) / ranges;
         for (int p = 0; p < pages; p += per_range) {
-          send_job(next_worker % num_workers, ij.pdf_path.c_str(),
-                   ij.out_pattern.c_str(), ij.dpi, ij.comp,
-                   p, std::min(p + per_range, pages));
-          next_worker++;
+          send_job(pick_w(), pdf_path, out_pattern,
+                   dpi, comp, p, std::min(p + per_range, pages));
         }
       } else {
-        send_job(next_worker++ % num_workers, ij.pdf_path.c_str(),
-                 ij.out_pattern.c_str(), ij.dpi, ij.comp, -1, 0);
+        send_job(pick_w(), pdf_path, out_pattern, dpi, comp, -1, 0);
       }
     } else {
-      send_job(next_worker++ % num_workers, ij.pdf_path.c_str(),
-               ij.out_pattern.c_str(), ij.dpi, ij.comp, -1, 0);
+      send_job(pick_w(), pdf_path, out_pattern, dpi, comp, -1, 0);
     }
   }
 
@@ -916,6 +964,66 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  // --raw input.pdf [dpi] [--no-aa]
+  // Renders all pages and writes PixelHeader + raw RGBA to stdout. Zero disk I/O.
+  if (argc >= 3 && std::string_view{argv[1]} == "--raw") {
+    InitPdfium();
+    const auto* pdf_path = argv[2];
+    const auto dpi = (argc > 3 && argv[3][0] != '-') ? static_cast<float>(std::atof(argv[3])) : 150.0f;
+    bool no_aa = false;
+    for (int i = 3; i < argc; ++i)
+      if (std::string_view{argv[i]} == "--no-aa") no_aa = true;
+
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
+
+    size_t file_size = 0;
+    auto* file_data = ReadFileToMemory(pdf_path, file_size);
+    if (!file_data) { std::fprintf(stderr, "Failed to read: %s\n", pdf_path); return 1; }
+
+    auto* doc = FPDF_LoadMemDocument64(file_data, file_size, nullptr);
+    if (!doc) { std::fprintf(stderr, "Failed to open: %s\n", pdf_path); std::free(file_data); return 1; }
+
+    const auto pages = FPDF_GetPageCount(doc);
+    for (int i = 0; i < pages; ++i) {
+      auto* page = FPDF_LoadPage(doc, i);
+      if (!page) continue;
+
+      const auto scale = dpi / kPointsPerInch;
+      const auto w = static_cast<int>(FPDF_GetPageWidth(page) * scale + 0.5f);
+      const auto h = static_cast<int>(FPDF_GetPageHeight(page) * scale + 0.5f);
+      if (w <= 0 || h <= 0) { FPDF_ClosePage(page); continue; }
+
+      const auto stride = (w * 4 + 63) & ~63;
+      const auto buf_size = static_cast<size_t>(stride) * h;
+
+      auto& pool = fast_png::GetProcessLocalPool();
+      auto* buffer = pool.Acquire(buf_size);
+      if (!buffer) { FPDF_ClosePage(page); continue; }
+
+      auto* bitmap = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRx, buffer, stride);
+      if (!bitmap) { FPDF_ClosePage(page); continue; }
+
+      int flags = FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER;
+      if (no_aa) flags |= kNoAA;
+      FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);
+      FPDF_RenderPageBitmap(bitmap, page, 0, 0, w, h, 0, flags);
+      FPDFBitmap_Destroy(bitmap);
+      FPDF_ClosePage(page);
+
+      PixelHeader hdr{w, h, stride, 4};
+      std::fwrite(&hdr, sizeof(hdr), 1, stdout);
+      std::fwrite(buffer, 1, buf_size, stdout);
+    }
+    std::fflush(stdout);
+
+    FPDF_CloseDocument(doc);
+    std::free(file_data);
+    FPDF_DestroyLibrary();
+    return 0;
+  }
+
   if (argc == 2 && std::string_view{argv[1]} == "--daemon")
     return RunDaemon();
 
@@ -928,14 +1036,15 @@ int main(int argc, char* argv[]) {
     const auto dpi = (argc > 2) ? static_cast<float>(std::atof(argv[2])) : 150.0f;
     auto workers = (argc > 3) ? std::atoi(argv[3]) : 4;
     auto compression = 2;
+    bool no_aa = false;
     for (int i = 4; i < argc; ++i) {
-      if (std::string_view{argv[i]} == "-c" && i + 1 < argc) {
+      if (std::string_view{argv[i]} == "-c" && i + 1 < argc)
         compression = std::clamp(std::atoi(argv[i + 1]), -1, 2);
-        break;
-      }
+      if (std::string_view{argv[i]} == "--no-aa")
+        no_aa = true;
     }
     workers = std::clamp(workers, 1, kMaxWorkers);
-    return RunPool(workers, dpi, compression);
+    return RunPool(workers, dpi, compression, no_aa);
   }
 #endif
 
@@ -946,25 +1055,26 @@ int main(int argc, char* argv[]) {
     return RunPoolWorkerWin(cmd_h, result_h);
   }
 
-  // --pool [dpi] [workers] [-c level]  (Windows version)
   if (argc >= 2 && (std::string_view{argv[1]} == "--pool" ||
                      std::string_view{argv[1]} == "--batch")) {
     const auto dpi = (argc > 2) ? static_cast<float>(std::atof(argv[2])) : 150.0f;
     auto workers = (argc > 3) ? std::atoi(argv[3]) : 4;
     auto compression = 2;
+    bool no_aa = false;
     for (int i = 4; i < argc; ++i) {
-      if (std::string_view{argv[i]} == "-c" && i + 1 < argc) {
+      if (std::string_view{argv[i]} == "-c" && i + 1 < argc)
         compression = std::clamp(std::atoi(argv[i + 1]), -1, 2);
-        break;
-      }
+      if (std::string_view{argv[i]} == "--no-aa")
+        no_aa = true;
     }
     workers = std::clamp(workers, 1, kMaxWorkers);
-    return RunPoolWin(workers, dpi, compression);
+    return RunPoolWin(workers, dpi, compression, no_aa);
   }
 
-  if (argc == 7 && std::string_view{argv[1]} == "--worker") {
+  if ((argc == 7 || argc == 8) && std::string_view{argv[1]} == "--worker") {
     const auto dpi = std::atoi(argv[4]) / 10.0f;
-    return RunWindowsWorker(argv[2], dpi, argv[3], std::atoi(argv[5]), argv[6]);
+    const bool w_no_aa = (argc == 8) ? std::atoi(argv[7]) != 0 : false;
+    return RunWindowsWorker(argv[2], dpi, argv[3], std::atoi(argv[5]), argv[6], w_no_aa);
   }
 #endif
 
@@ -990,12 +1100,13 @@ int main(int argc, char* argv[]) {
   const auto dpi = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 150.0f;
   auto workers = (argc > 4) ? std::atoi(argv[4]) : 4;
   auto compression = 2;
+  bool no_aa = false;
 
   for (int i = 5; i < argc; ++i) {
-    if (std::string_view{argv[i]} == "-c" && i + 1 < argc) {
+    if (std::string_view{argv[i]} == "-c" && i + 1 < argc)
       compression = std::clamp(std::atoi(argv[i + 1]), -1, 2);
-      break;
-    }
+    if (std::string_view{argv[i]} == "--no-aa")
+      no_aa = true;
   }
 
   if (dpi <= 0 || dpi > kMaxDpi) { std::fprintf(stderr, "DPI must be 1-%.0f\n", kMaxDpi); return 1; }
@@ -1018,8 +1129,8 @@ int main(int argc, char* argv[]) {
   const auto t0 = std::chrono::high_resolution_clock::now();
 
   const auto result = (workers > 1)
-      ? RenderMulti(pdf_path, dpi, pattern, pages, workers, compression)
-      : RenderSingle(pdf_path, dpi, pattern, pages, compression);
+      ? RenderMulti(pdf_path, dpi, pattern, pages, workers, compression, no_aa)
+      : RenderSingle(pdf_path, dpi, pattern, pages, compression, no_aa);
 
   FPDF_DestroyLibrary();
 
