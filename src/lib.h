@@ -5,8 +5,10 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 #include <expected>
@@ -81,6 +83,17 @@ public:
     // Render specific page range [start, end)
     [[nodiscard]] RenderResult render_pages(std::string_view pdf_path,
                                              int start, int end, Options opts = {}) const;
+
+    // Process many PDFs in parallel using fork().
+    // Forks num_workers processes; each grabs the next PDF via atomic counter.
+    // opts.workers controls per-PDF page parallelism (0 = single-threaded per PDF).
+    // Callback runs in worker process — use it for OCR, analysis, etc.
+    // Returns total number of PDFs successfully processed.
+    using PageCallback = std::function<void(std::string_view pdf_path,
+                                            std::vector<Page>& pages)>;
+    int process_many(const std::vector<std::string>& pdf_paths,
+                     Options opts, int num_workers,
+                     PageCallback callback) const;
 
 private:
     struct Impl;

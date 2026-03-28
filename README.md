@@ -1,11 +1,3 @@
-<p align="center">
-  <sub>Built for <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents.</sub>
-</p>
-
-<p align="center">
-  <a href="https://miruiq.com"><img src=".github/assets/miruiq_screenshot.png" alt="Miruiq" width="500"></a>
-</p>
-
 # fastpdf2png
 
 Ultra-fast PDF to PNG converter. Pre-forked worker pool, SIMD-optimized encoding, automatic grayscale detection, zero-copy RGBA rendering. MIT licensed.
@@ -269,3 +261,9 @@ fastpdf2png --daemon
 ## License
 
 MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+---
+
+<p align="center">
+  <sub>Used by <a href="https://miruiq.com"><strong>Miruiq</strong></a> — AI-powered data extraction from PDFs and documents.</sub>
+</p>

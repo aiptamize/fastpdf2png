@@ -35,7 +35,7 @@ constexpr float kPointsPerInch = 72.0f;
 constexpr int kNoAA = FPDF_RENDER_NO_SMOOTHTEXT | FPDF_RENDER_NO_SMOOTHIMAGE |
                       FPDF_RENDER_NO_SMOOTHPATH;
 
-// Read file into memory
+// Read file into memory. Caller must free().
 std::pair<uint8_t*, size_t> ReadFile(std::string_view path) {
     std::string p(path);
     auto* f = std::fopen(p.c_str(), "rb");
@@ -45,8 +45,9 @@ std::pair<uint8_t*, size_t> ReadFile(std::string_view path) {
     std::fseek(f, 0, SEEK_SET);
     auto* buf = static_cast<uint8_t*>(std::malloc(size));
     if (!buf) { std::fclose(f); return {nullptr, 0}; }
-    std::fread(buf, 1, size, f);
+    size_t read = std::fread(buf, 1, size, f);
     std::fclose(f);
+    if (read != size) { std::free(buf); return {nullptr, 0}; }
     return {buf, size};
 }
 
@@ -98,6 +99,13 @@ struct SharedPageResult {
     size_t data_offset;  // offset into shared data buffer
     int32_t valid;       // 1 if rendered successfully
 };
+
+// Helper: mmap shared anonymous memory. Returns nullptr on failure.
+void* MmapShared(size_t size) {
+    auto* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? nullptr : p;
+}
 #endif
 
 } // namespace
@@ -148,40 +156,43 @@ RenderResult Engine::render(std::string_view pdf_path, Options opts) const {
     int total = FPDF_GetPageCount(doc);
 
 #ifndef _WIN32
-    // Multi-process rendering: only when explicitly requested and not called from
-    // a host process (Python/Node) where fork() is unsafe due to ObjC/threading.
-    int workers = opts.workers;  // 0 = single-threaded (safe default for library use)
+    int workers = opts.workers;
 
     if (workers > 1 && total > 1) {
-        // Multi-process: fork workers, each renders a page range
         FPDF_CloseDocument(doc);
 
-        // Allocate shared state
         auto* shared = static_cast<SharedRenderState*>(
-            mmap(nullptr, sizeof(SharedRenderState), PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-        shared->next_page.store(0);
+            MmapShared(sizeof(SharedRenderState)));
+        if (!shared) { std::free(data); return std::unexpected(Error::AllocFailed); }
+        new (&shared->next_page) std::atomic<int>(0);
         shared->total_pages = total;
 
-        // Allocate shared result metadata
         auto meta_size = sizeof(SharedPageResult) * total;
-        auto* meta = static_cast<SharedPageResult*>(
-            mmap(nullptr, meta_size, PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+        auto* meta = static_cast<SharedPageResult*>(MmapShared(meta_size));
+        if (!meta) {
+            munmap(shared, sizeof(SharedRenderState));
+            std::free(data);
+            return std::unexpected(Error::AllocFailed);
+        }
         std::memset(meta, 0, meta_size);
 
-        // Estimate max buffer size per page
-        // At 150 DPI, letter = ~1275x1650 = ~8.4MB per page
-        const size_t max_page_size = static_cast<size_t>(
-            (opts.dpi / 72.0f * 900) * (opts.dpi / 72.0f * 1200) * 4 + 65536);
+        // Compute max page buffer size with overflow protection
+        const double pw = static_cast<double>(opts.dpi) / 72.0 * 900.0;
+        const double ph = static_cast<double>(opts.dpi) / 72.0 * 1200.0;
+        const double max_pg_d = pw * ph * 4.0 + 65536.0;
+        if (max_pg_d > 1e12 || max_pg_d * total > 1e12) {
+            munmap(meta, meta_size);
+            munmap(shared, sizeof(SharedRenderState));
+            std::free(data);
+            return std::unexpected(Error::AllocFailed);
+        }
+        const size_t max_page_size = static_cast<size_t>(max_pg_d);
         const size_t data_buf_size = max_page_size * total;
 
-        auto* data_buf = static_cast<uint8_t*>(
-            mmap(nullptr, data_buf_size, PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-        if (data_buf == MAP_FAILED) {
-            munmap(shared, sizeof(SharedRenderState));
+        auto* data_buf = static_cast<uint8_t*>(MmapShared(data_buf_size));
+        if (!data_buf) {
             munmap(meta, meta_size);
+            munmap(shared, sizeof(SharedRenderState));
             std::free(data);
             return std::unexpected(Error::AllocFailed);
         }
@@ -191,9 +202,8 @@ RenderResult Engine::render(std::string_view pdf_path, Options opts) const {
         for (int i = 0; i < workers; ++i) {
             auto pid = fork();
             if (pid == 0) {
-                // Child: re-open doc from memory (inherited via COW)
                 auto* child_doc = FPDF_LoadMemDocument64(data, size, nullptr);
-                if (!child_doc) std::exit(1);
+                if (!child_doc) _exit(1);
 
                 while (true) {
                     int pg = shared->next_page.fetch_add(1, std::memory_order_relaxed);
@@ -231,8 +241,7 @@ RenderResult Engine::render(std::string_view pdf_path, Options opts) const {
                 }
 
                 FPDF_CloseDocument(child_doc);
-                FPDF_DestroyLibrary();
-                std::exit(0);
+                _exit(0);
             } else if (pid > 0) {
                 children.push_back(pid);
             }
@@ -248,6 +257,7 @@ RenderResult Engine::render(std::string_view pdf_path, Options opts) const {
             if (meta[i].valid) {
                 auto buf_size_pg = static_cast<size_t>(meta[i].stride) * meta[i].height;
                 auto* copy = static_cast<uint8_t*>(std::malloc(buf_size_pg));
+                if (!copy) continue;  // skip page on OOM
                 std::memcpy(copy, data_buf + meta[i].data_offset, buf_size_pg);
                 pages.emplace_back(copy, meta[i].width, meta[i].height, meta[i].stride);
             }
@@ -289,6 +299,100 @@ RenderResult Engine::render_pages(std::string_view pdf_path,
     return pages;
 }
 
+// --- process_many: fork workers, each grabs PDFs and calls user callback ---
+
+#ifndef _WIN32
+int Engine::process_many(const std::vector<std::string>& pdf_paths,
+                          Options opts, int num_workers,
+                          PageCallback callback) const {
+    const int total = static_cast<int>(pdf_paths.size());
+    if (total == 0) return 0;
+    num_workers = std::clamp(num_workers, 1, total);
+
+    if (num_workers <= 1) {
+        int done = 0;
+        for (auto& path : pdf_paths) {
+            auto [data, size] = ReadFile(path);
+            if (!data) continue;
+            auto* doc = FPDF_LoadMemDocument64(data, size, nullptr);
+            if (!doc) { std::free(data); continue; }
+            auto pages = RenderDoc(doc, 0, FPDF_GetPageCount(doc), opts.dpi, opts.no_aa);
+            FPDF_CloseDocument(doc);
+            std::free(data);
+            callback(path, pages);
+            ++done;
+        }
+        return done;
+    }
+
+    // All counters in mmap shared memory — visible across fork
+    struct alignas(64) SharedState {
+        std::atomic<int> next{0};
+        std::atomic<int> done_pdfs{0};
+        std::atomic<int> done_pages{0};
+    };
+
+    auto* shared = static_cast<SharedState*>(MmapShared(sizeof(SharedState)));
+    if (!shared) return 0;
+    new (&shared->next) std::atomic<int>(0);
+    new (&shared->done_pdfs) std::atomic<int>(0);
+    new (&shared->done_pages) std::atomic<int>(0);
+
+    std::vector<pid_t> children;
+    children.reserve(num_workers);
+
+    for (int i = 0; i < num_workers; ++i) {
+        auto pid = fork();
+        if (pid == 0) {
+            while (true) {
+                int idx = shared->next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= total) break;
+
+                auto [fdata, fsize] = ReadFile(pdf_paths[idx]);
+                if (!fdata) continue;
+                auto* doc = FPDF_LoadMemDocument64(fdata, fsize, nullptr);
+                if (!doc) { std::free(fdata); continue; }
+
+                auto pages = RenderDoc(doc, 0, FPDF_GetPageCount(doc),
+                                       opts.dpi, opts.no_aa);
+                FPDF_CloseDocument(doc);
+                std::free(fdata);
+
+                callback(pdf_paths[idx], pages);
+
+                shared->done_pdfs.fetch_add(1, std::memory_order_relaxed);
+                shared->done_pages.fetch_add(
+                    static_cast<int>(pages.size()), std::memory_order_relaxed);
+            }
+            _exit(0);
+        } else if (pid > 0) {
+            children.push_back(pid);
+        }
+    }
+
+    for (auto pid : children)
+        waitpid(pid, nullptr, 0);
+
+    int result = shared->done_pdfs.load(std::memory_order_acquire);
+    munmap(shared, sizeof(SharedState));
+    return result;
+}
+#else
+int Engine::process_many(const std::vector<std::string>& pdf_paths,
+                          Options opts, int num_workers,
+                          PageCallback callback) const {
+    int done = 0;
+    for (auto& path : pdf_paths) {
+        auto result = render(path, opts);
+        if (result) {
+            callback(path, *result);
+            ++done;
+        }
+    }
+    return done;
+}
+#endif
+
 // --- C API ---
 
 static Engine* g_engine = nullptr;
@@ -319,6 +423,7 @@ int fpdf2png_render(const char* path, float dpi, int no_aa,
     auto& pages = *result;
     *count = static_cast<int>(pages.size());
     *out = static_cast<fpdf2png_page_c*>(std::malloc(sizeof(fpdf2png_page_c) * pages.size()));
+    if (!*out) { *count = 0; return static_cast<int>(Error::AllocFailed); }
     for (size_t i = 0; i < pages.size(); ++i) {
         (*out)[i] = {pages[i].data.release(), pages[i].width, pages[i].height, pages[i].stride};
     }
@@ -335,6 +440,7 @@ int fpdf2png_render_mem(const uint8_t* data, size_t size, float dpi, int no_aa,
     auto& pages = *result;
     *count = static_cast<int>(pages.size());
     *out = static_cast<fpdf2png_page_c*>(std::malloc(sizeof(fpdf2png_page_c) * pages.size()));
+    if (!*out) { *count = 0; return static_cast<int>(Error::AllocFailed); }
     for (size_t i = 0; i < pages.size(); ++i) {
         (*out)[i] = {pages[i].data.release(), pages[i].width, pages[i].height, pages[i].stride};
     }
