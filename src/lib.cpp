@@ -394,125 +394,48 @@ int Engine::process_many(const std::vector<std::string>& pdf_paths,
 }
 #endif
 
-// --- Pool: persistent forked workers with pipe IPC ---
+// --- Pool: persistent workers with shared-memory work-stealing ---
+//
+// Architecture:
+//   - Shared mmap'd job queue (array of PoolJob slots)
+//   - Atomic tail (parent advances on submit) + atomic head (workers advance to grab)
+//   - Single wake pipe: parent writes 1 byte per job, workers read 1 byte to wake
+//   - Workers steal jobs — fast workers automatically get more work
+//   - Zero per-job pipe overhead (only 1 byte signal, not 512-byte struct)
 
 #ifndef _WIN32
 
 namespace {
 
-struct PoolJob {
+constexpr int kMaxPoolJobs = 16384;  // max queued jobs before blocking
+
+struct alignas(64) PoolShared {
+    std::atomic<int> tail{0};     // next slot to write (parent)
+    char pad1[60];
+    std::atomic<int> head{0};     // next slot to read (workers)
+    char pad2[60];
+    std::atomic<int> done{0};     // completed count
+    char pad3[60];
+    std::atomic<bool> shutdown{false};
+};
+
+struct PoolJobSlot {
     char pdf_path[512];
     float dpi;
     bool no_aa;
-    bool shutdown;  // true = worker should exit
 };
-
-struct PoolResult {
-    char pdf_path[512];
-    int pages_rendered;
-};
-
-[[noreturn]] void PoolWorkerLoop(int cmd_fd, int result_fd,
-                                  Pool::Callback default_cb) {
-    // Worker has its own PDFium via COW from parent fork
-    PoolJob job{};
-    while (true) {
-        // Block on pipe — zero CPU when idle
-        auto* p = reinterpret_cast<uint8_t*>(&job);
-        size_t remaining = sizeof(job);
-        while (remaining > 0) {
-            auto n = read(cmd_fd, p, remaining);
-            if (n <= 0) goto done;
-            p += n;
-            remaining -= n;
-        }
-
-        if (job.shutdown) break;
-
-        auto [fdata, fsize] = ReadFile(job.pdf_path);
-        FPDF_DOCUMENT doc = fdata ? FPDF_LoadMemDocument64(fdata, fsize, nullptr) : nullptr;
-
-        PoolResult result{};
-        std::strncpy(result.pdf_path, job.pdf_path, sizeof(result.pdf_path) - 1);
-
-        if (doc) {
-            auto pages = RenderDoc(doc, 0, FPDF_GetPageCount(doc), job.dpi, job.no_aa);
-            FPDF_CloseDocument(doc);
-            result.pages_rendered = static_cast<int>(pages.size());
-            if (default_cb) default_cb(job.pdf_path, pages);
-        }
-        std::free(fdata);
-
-        // Send result back (non-blocking for parent to collect)
-        auto* rp = reinterpret_cast<const uint8_t*>(&result);
-        size_t rrem = sizeof(result);
-        while (rrem > 0) {
-            auto n = write(result_fd, rp, rrem);
-            if (n <= 0) goto done;
-            rp += n;
-            rrem -= n;
-        }
-    }
-
-done:
-    close(cmd_fd);
-    close(result_fd);
-    _exit(0);
-}
 
 } // namespace
 
 struct Pool::Impl {
-    struct Worker {
-        pid_t pid;
-        int cmd_fd;
-        int result_fd;
-        int in_flight;
-    };
+    PoolShared* shared = nullptr;
+    PoolJobSlot* slots = nullptr;
+    int wake_pipe[2] = {-1, -1};  // parent writes, workers read
 
-    std::vector<Worker> workers;
-    Options opts;
+    std::vector<pid_t> children;
     Callback default_callback;
+    Options opts;
     int submitted = 0;
-    int completed_count = 0;
-
-    // Pick worker with fewest in-flight jobs
-    int pick_worker() {
-        int best = 0;
-        for (int i = 1; i < static_cast<int>(workers.size()); ++i)
-            if (workers[i].in_flight < workers[best].in_flight) best = i;
-        return best;
-    }
-
-    // Drain ready results (non-blocking)
-    void drain() {
-        std::vector<struct pollfd> pfds(workers.size());
-        for (size_t i = 0; i < workers.size(); ++i)
-            pfds[i] = {workers[i].result_fd, POLLIN, 0};
-
-        while (true) {
-            int ready = poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 0);
-            if (ready <= 0) break;
-            for (size_t i = 0; i < workers.size(); ++i) {
-                if (pfds[i].revents & POLLIN) {
-                    PoolResult result{};
-                    auto* p = reinterpret_cast<uint8_t*>(&result);
-                    size_t rem = sizeof(result);
-                    bool ok = true;
-                    while (rem > 0) {
-                        auto n = read(workers[i].result_fd, p, rem);
-                        if (n <= 0) { ok = false; break; }
-                        p += n;
-                        rem -= n;
-                    }
-                    if (ok) {
-                        workers[i].in_flight--;
-                        completed_count++;
-                    }
-                }
-            }
-        }
-    }
 };
 
 Pool::Pool(int num_workers, Options opts, Callback callback)
@@ -520,112 +443,133 @@ Pool::Pool(int num_workers, Options opts, Callback callback)
     impl_->opts = opts;
     impl_->default_callback = std::move(callback);
 
-    // Init PDFium in parent so workers inherit it via fork COW
+    // Shared state
+    impl_->shared = static_cast<PoolShared*>(MmapShared(sizeof(PoolShared)));
+    if (!impl_->shared) return;
+    new (&impl_->shared->tail) std::atomic<int>(0);
+    new (&impl_->shared->head) std::atomic<int>(0);
+    new (&impl_->shared->done) std::atomic<int>(0);
+    new (&impl_->shared->shutdown) std::atomic<bool>(false);
+
+    // Job slots
+    impl_->slots = static_cast<PoolJobSlot*>(
+        MmapShared(sizeof(PoolJobSlot) * kMaxPoolJobs));
+    if (!impl_->slots) {
+        munmap(impl_->shared, sizeof(PoolShared));
+        impl_->shared = nullptr;
+        return;
+    }
+
+    // Wake pipe
+    if (pipe(impl_->wake_pipe) != 0) {
+        munmap(impl_->slots, sizeof(PoolJobSlot) * kMaxPoolJobs);
+        munmap(impl_->shared, sizeof(PoolShared));
+        impl_->shared = nullptr;
+        return;
+    }
+
+    // Init PDFium before fork so workers inherit
     FPDF_LIBRARY_CONFIG config{};
     config.version = 2;
     FPDF_InitLibraryWithConfig(&config);
 
     num_workers = std::max(1, num_workers);
-    impl_->workers.resize(num_workers);
+    auto cb = impl_->default_callback;
+    auto* shared = impl_->shared;
+    auto* slots = impl_->slots;
+    int wake_rd = impl_->wake_pipe[0];
+    float dpi = opts.dpi;
+    bool no_aa = opts.no_aa;
 
     for (int i = 0; i < num_workers; ++i) {
-        int cmd_pipe[2], result_pipe[2];
-        if (pipe(cmd_pipe) != 0 || pipe(result_pipe) != 0) continue;
-
         auto pid = fork();
         if (pid == 0) {
-            // Child
-            close(cmd_pipe[1]);
-            close(result_pipe[0]);
-            for (int j = 0; j < i; ++j) {
-                close(impl_->workers[j].cmd_fd);
-                close(impl_->workers[j].result_fd);
-            }
-            PoolWorkerLoop(cmd_pipe[0], result_pipe[1], impl_->default_callback);
-        }
+            // Child: close write end
+            close(impl_->wake_pipe[1]);
 
-        close(cmd_pipe[0]);
-        close(result_pipe[1]);
-        impl_->workers[i] = {pid, cmd_pipe[1], result_pipe[0], 0};
+            while (true) {
+                // Wait for wake signal (1 byte per job) or pipe close
+                char buf;
+                auto n = read(wake_rd, &buf, 1);
+                if (n <= 0) break;  // pipe closed = shutdown
+
+                // Grab a job (work-stealing)
+                int idx = shared->head.fetch_add(1, std::memory_order_acquire);
+                int tail = shared->tail.load(std::memory_order_acquire);
+                if (idx >= tail) continue;  // spurious wake
+
+                auto& job = slots[idx % kMaxPoolJobs];
+
+                auto [fdata, fsize] = ReadFile(job.pdf_path);
+                if (fdata) {
+                    auto* doc = FPDF_LoadMemDocument64(fdata, fsize, nullptr);
+                    if (doc) {
+                        auto pages = RenderDoc(doc, 0, FPDF_GetPageCount(doc),
+                                               job.dpi, job.no_aa);
+                        FPDF_CloseDocument(doc);
+                        if (cb) cb(job.pdf_path, pages);
+                    }
+                    std::free(fdata);
+                }
+
+                shared->done.fetch_add(1, std::memory_order_release);
+            }
+
+            close(wake_rd);
+            _exit(0);
+        } else if (pid > 0) {
+            impl_->children.push_back(pid);
+        }
     }
 }
 
 Pool::~Pool() {
-    // Send shutdown to all workers
-    for (auto& w : impl_->workers) {
-        PoolJob job{};
-        job.shutdown = true;
-        write(w.cmd_fd, &job, sizeof(job));
-        close(w.cmd_fd);
-    }
-    for (auto& w : impl_->workers) {
-        close(w.result_fd);
-        waitpid(w.pid, nullptr, 0);
-    }
+    if (!impl_->shared) return;
+
+    // Close write end of wake pipe — workers will see EOF and exit
+    close(impl_->wake_pipe[1]);
+    close(impl_->wake_pipe[0]);
+
+    for (auto pid : impl_->children)
+        waitpid(pid, nullptr, 0);
+
+    munmap(impl_->slots, sizeof(PoolJobSlot) * kMaxPoolJobs);
+    munmap(impl_->shared, sizeof(PoolShared));
     FPDF_DestroyLibrary();
 }
 
 void Pool::submit(const std::string& pdf_path) {
-    // Drain completed results first to keep in_flight counts accurate
-    impl_->drain();
+    if (!impl_->shared) return;
 
-    PoolJob job{};
-    std::strncpy(job.pdf_path, pdf_path.c_str(), sizeof(job.pdf_path) - 1);
-    job.dpi = impl_->opts.dpi;
-    job.no_aa = impl_->opts.no_aa;
-    job.shutdown = false;
+    int idx = impl_->submitted;
+    auto& slot = impl_->slots[idx % kMaxPoolJobs];
+    std::strncpy(slot.pdf_path, pdf_path.c_str(), sizeof(slot.pdf_path) - 1);
+    slot.pdf_path[sizeof(slot.pdf_path) - 1] = '\0';
+    slot.dpi = impl_->opts.dpi;
+    slot.no_aa = impl_->opts.no_aa;
 
-    int w = impl_->pick_worker();
-    auto* p = reinterpret_cast<const uint8_t*>(&job);
-    size_t rem = sizeof(job);
-    while (rem > 0) {
-        auto n = write(impl_->workers[w].cmd_fd, p, rem);
-        if (n <= 0) break;
-        p += n;
-        rem -= n;
-    }
-    impl_->workers[w].in_flight++;
+    impl_->shared->tail.store(idx + 1, std::memory_order_release);
     impl_->submitted++;
+
+    // Wake one worker
+    char c = 1;
+    write(impl_->wake_pipe[1], &c, 1);
 }
 
 void Pool::submit(const std::string& pdf_path, Callback) {
-    // Per-job callback not supported in fork model — use default callback
     submit(pdf_path);
 }
 
 void Pool::wait() {
-    // Block-read remaining results using poll
-    while (impl_->completed_count < impl_->submitted) {
-        std::vector<struct pollfd> pfds(impl_->workers.size());
-        for (size_t i = 0; i < impl_->workers.size(); ++i)
-            pfds[i] = {impl_->workers[i].result_fd, POLLIN, 0};
-
-        int ready = poll(pfds.data(), static_cast<nfds_t>(pfds.size()), 5000);
-        if (ready <= 0) continue;
-
-        for (size_t i = 0; i < impl_->workers.size(); ++i) {
-            if (pfds[i].revents & POLLIN) {
-                PoolResult result{};
-                auto* p = reinterpret_cast<uint8_t*>(&result);
-                size_t rem = sizeof(result);
-                bool ok = true;
-                while (rem > 0) {
-                    auto n = read(impl_->workers[i].result_fd, p, rem);
-                    if (n <= 0) { ok = false; break; }
-                    p += n;
-                    rem -= n;
-                }
-                if (ok) {
-                    impl_->workers[i].in_flight--;
-                    impl_->completed_count++;
-                }
-            }
-        }
+    if (!impl_->shared) return;
+    while (impl_->shared->done.load(std::memory_order_acquire) < impl_->submitted) {
+        usleep(100);  // 100µs poll — workers are doing the heavy lifting
     }
 }
 
 int Pool::completed() const {
-    return impl_->completed_count;
+    if (!impl_->shared) return 0;
+    return impl_->shared->done.load(std::memory_order_acquire);
 }
 
 #endif
