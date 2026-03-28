@@ -394,30 +394,32 @@ int Engine::process_many(const std::vector<std::string>& pdf_paths,
 }
 #endif
 
-// --- Pool: persistent workers, streaming results via shared memory ---
+// --- Pool: persistent workers, hybrid shared-memory + pipe results ---
 //
-// submit() → job queue (shared mmap + wake pipe) → workers steal jobs →
-// render into shared pixel buffer → write result metadata to result pipe →
-// next() reads one result at a time, copies pixels out, returns PoolResult.
+// Workers render into shared memory (per-page slots from atomic allocator),
+// send lightweight metadata through per-worker pipes.
+// Parent reads metadata, copies pixels from shared memory, frees slots.
+// Atomic slot free-list ensures no race conditions.
 
 #ifndef _WIN32
 
 namespace {
 
 constexpr int kMaxPoolJobs = 16384;
-// Max pixel bytes per page slot (enough for A3 at 300 DPI)
-constexpr size_t kMaxPixelsPerPage = 64ULL * 1024 * 1024;  // 64 MB
-constexpr int kMaxPagesPerPdf = 256;
+constexpr int kMaxPagesPerResult = 512;
+
+// Shared page slot pool — workers allocate, parent frees after copying
+constexpr size_t kPageSlotSize = 48ULL * 1024 * 1024;  // 48MB max per page
+constexpr int kNumPageSlots = 64;
 
 struct alignas(64) PoolShared {
-    std::atomic<int> job_tail{0};   // parent writes
+    std::atomic<int> job_tail{0};
     char pad1[60];
-    std::atomic<int> job_head{0};   // workers read (steal)
+    std::atomic<int> job_head{0};
     char pad2[60];
-    std::atomic<int> done{0};
-    char pad3[60];
-    // Per-slot pixel buffer offset allocator (bump allocator)
-    std::atomic<size_t> pixel_alloc{0};
+    // Page slot free stack (lock-free)
+    std::atomic<int> slot_stack[kNumPageSlots];
+    std::atomic<int> slot_top{0};  // index into slot_stack
 };
 
 struct PoolJobSlot {
@@ -426,14 +428,14 @@ struct PoolJobSlot {
     bool no_aa;
 };
 
-// Written by worker to result pipe — small, fixed size
-struct PoolResultMeta {
+// Lightweight result metadata sent through pipe (no pixel data)
+struct PoolResultHdr {
     char pdf_path[512];
-    int num_pages;
-    struct PageMeta {
+    int32_t num_pages;
+    struct PageInfo {
         int32_t width, height, stride;
-        size_t pixel_offset;  // into shared pixel buffer
-    } pages[kMaxPagesPerPdf];
+        int32_t slot_idx;  // index into shared page slot pool (-1 = skipped)
+    } pages[kMaxPagesPerResult];
 };
 
 } // namespace
@@ -441,15 +443,10 @@ struct PoolResultMeta {
 struct Pool::Impl {
     PoolShared* shared = nullptr;
     PoolJobSlot* job_slots = nullptr;
-    uint8_t* pixel_buf = nullptr;
-    size_t pixel_buf_size = 0;
-
+    uint8_t* page_slots = nullptr;  // kNumPageSlots × kPageSlotSize
     int wake_pipe[2] = {-1, -1};
 
-    struct WorkerInfo {
-        pid_t pid;
-        int result_rd;  // per-worker result pipe (read end)
-    };
+    struct WorkerInfo { pid_t pid; int result_rd; };
     std::vector<WorkerInfo> workers;
     Options opts;
     int submit_count = 0;
@@ -465,8 +462,11 @@ Pool::Pool(int num_workers, Options opts)
     if (!impl_->shared) return;
     new (&impl_->shared->job_tail) std::atomic<int>(0);
     new (&impl_->shared->job_head) std::atomic<int>(0);
-    new (&impl_->shared->done) std::atomic<int>(0);
-    new (&impl_->shared->pixel_alloc) std::atomic<size_t>(0);
+    // Initialize free slot stack: all slots available
+    new (&impl_->shared->slot_top) std::atomic<int>(kNumPageSlots);
+    for (int i = 0; i < kNumPageSlots; ++i) {
+        new (&impl_->shared->slot_stack[i]) std::atomic<int>(i);
+    }
 
     impl_->job_slots = static_cast<PoolJobSlot*>(
         MmapShared(sizeof(PoolJobSlot) * kMaxPoolJobs));
@@ -476,15 +476,10 @@ Pool::Pool(int num_workers, Options opts)
         return;
     }
 
-    // Shared pixel buffer — 2 GB max (handles ~200 pages at 300 DPI)
-    impl_->pixel_buf_size = 2ULL * 1024 * 1024 * 1024;
-    impl_->pixel_buf = static_cast<uint8_t*>(MmapShared(impl_->pixel_buf_size));
-    if (!impl_->pixel_buf) {
-        // Try smaller: 512 MB
-        impl_->pixel_buf_size = 512ULL * 1024 * 1024;
-        impl_->pixel_buf = static_cast<uint8_t*>(MmapShared(impl_->pixel_buf_size));
-    }
-    if (!impl_->pixel_buf) {
+    // Shared page pixel buffer
+    auto page_buf_size = static_cast<size_t>(kNumPageSlots) * kPageSlotSize;
+    impl_->page_slots = static_cast<uint8_t*>(MmapShared(page_buf_size));
+    if (!impl_->page_slots) {
         munmap(impl_->job_slots, sizeof(PoolJobSlot) * kMaxPoolJobs);
         munmap(impl_->shared, sizeof(PoolShared));
         impl_->shared = nullptr;
@@ -492,7 +487,7 @@ Pool::Pool(int num_workers, Options opts)
     }
 
     if (pipe(impl_->wake_pipe) != 0) {
-        munmap(impl_->pixel_buf, impl_->pixel_buf_size);
+        munmap(impl_->page_slots, page_buf_size);
         munmap(impl_->job_slots, sizeof(PoolJobSlot) * kMaxPoolJobs);
         munmap(impl_->shared, sizeof(PoolShared));
         impl_->shared = nullptr;
@@ -506,8 +501,7 @@ Pool::Pool(int num_workers, Options opts)
     num_workers = std::max(1, num_workers);
     auto* shared = impl_->shared;
     auto* job_slots = impl_->job_slots;
-    auto* pixel_buf = impl_->pixel_buf;
-    auto pixel_buf_size = impl_->pixel_buf_size;
+    auto* page_slots = impl_->page_slots;
     int wake_rd = impl_->wake_pipe[0];
 
     for (int i = 0; i < num_workers; ++i) {
@@ -518,11 +512,31 @@ Pool::Pool(int num_workers, Options opts)
         if (pid == 0) {
             close(impl_->wake_pipe[1]);
             close(result_pipe[0]);
-            // Close other workers' result pipes
             for (auto& w : impl_->workers)
                 close(w.result_rd);
 
-            int result_wr = result_pipe[1];
+            int rfd = result_pipe[1];
+
+            // Try to alloc a page slot. Returns -1 if none available.
+            auto try_alloc_slot = [&]() -> int {
+                int top = shared->slot_top.load(std::memory_order_acquire);
+                while (top > 0) {
+                    if (shared->slot_top.compare_exchange_weak(
+                            top, top - 1, std::memory_order_acq_rel))
+                        return shared->slot_stack[top - 1].load(std::memory_order_relaxed);
+                }
+                return -1;  // no slots available
+            };
+
+            auto pipe_write = [](int fd, const void* buf, size_t count) -> bool {
+                auto* p = static_cast<const uint8_t*>(buf);
+                while (count > 0) {
+                    auto n = write(fd, p, count);
+                    if (n <= 0) return false;
+                    p += n; count -= n;
+                }
+                return true;
+            };
 
             while (true) {
                 char c;
@@ -532,68 +546,55 @@ Pool::Pool(int num_workers, Options opts)
                 if (idx >= shared->job_tail.load(std::memory_order_acquire)) continue;
 
                 auto& job = job_slots[idx % kMaxPoolJobs];
-                PoolResultMeta meta{};
-                std::strncpy(meta.pdf_path, job.pdf_path, sizeof(meta.pdf_path) - 1);
 
+                // Render all pages into local memory (RenderDoc mallocs each page)
                 auto [fdata, fsize] = ReadFile(job.pdf_path);
+                std::vector<Page> pages;
                 if (fdata) {
                     auto* doc = FPDF_LoadMemDocument64(fdata, fsize, nullptr);
                     if (doc) {
-                        int npages = FPDF_GetPageCount(doc);
-                        int rendered = 0;
-                        for (int p = 0; p < npages && rendered < kMaxPagesPerPdf; ++p) {
-                            auto* page = FPDF_LoadPage(doc, p);
-                            if (!page) continue;
-
-                            auto scale = job.dpi / kPointsPerInch;
-                            auto w = static_cast<int>(FPDF_GetPageWidth(page) * scale + 0.5f);
-                            auto h = static_cast<int>(FPDF_GetPageHeight(page) * scale + 0.5f);
-                            if (w <= 0 || h <= 0) { FPDF_ClosePage(page); continue; }
-
-                            auto stride = (w * 4 + 63) & ~63;
-                            auto pg_size = static_cast<size_t>(stride) * h;
-
-                            auto offset = shared->pixel_alloc.fetch_add(
-                                pg_size, std::memory_order_relaxed);
-                            if (offset + pg_size > pixel_buf_size) {
-                                FPDF_ClosePage(page);
-                                continue;
-                            }
-
-                            auto* buf = pixel_buf + offset;
-                            auto* bmp = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRx, buf, stride);
-                            if (!bmp) { FPDF_ClosePage(page); continue; }
-
-                            int flags = FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER;
-                            if (job.no_aa) flags |= kNoAA;
-                            FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
-                            FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, 0, flags);
-                            FPDFBitmap_Destroy(bmp);
-                            FPDF_ClosePage(page);
-
-                            meta.pages[rendered] = {w, h, stride, offset};
-                            rendered++;
-                        }
-                        meta.num_pages = rendered;
+                        pages = RenderDoc(doc, 0, FPDF_GetPageCount(doc),
+                                          job.dpi, job.no_aa);
                         FPDF_CloseDocument(doc);
                     }
                     std::free(fdata);
                 }
 
-                // Per-worker pipe — no interleaving
-                auto* mp = reinterpret_cast<const uint8_t*>(&meta);
-                size_t mrem = sizeof(meta);
-                while (mrem > 0) {
-                    auto n = write(result_wr, mp, mrem);
-                    if (n <= 0) break;
-                    mp += n;
-                    mrem -= n;
+                // Build header, copy pages to shared slots where possible
+                PoolResultHdr hdr{};
+                std::strncpy(hdr.pdf_path, job.pdf_path, sizeof(hdr.pdf_path) - 1);
+                hdr.num_pages = static_cast<int32_t>(
+                    std::min(pages.size(), static_cast<size_t>(kMaxPagesPerResult)));
+
+                for (int p = 0; p < hdr.num_pages; ++p) {
+                    auto& pg = pages[p];
+                    auto pg_size = static_cast<size_t>(pg.stride) * pg.height;
+                    int slot = (pg_size <= kPageSlotSize) ? try_alloc_slot() : -1;
+
+                    if (slot >= 0) {
+                        // Copy into shared memory slot
+                        std::memcpy(
+                            page_slots + static_cast<size_t>(slot) * kPageSlotSize,
+                            pg.data.get(), pg_size);
+                    }
+                    hdr.pages[p] = {pg.width, pg.height, pg.stride, slot};
                 }
-                shared->done.fetch_add(1, std::memory_order_release);
+
+                // Send header
+                pipe_write(rfd, &hdr, sizeof(hdr));
+
+                // For pages without shared slots, send pixels through pipe
+                for (int p = 0; p < hdr.num_pages; ++p) {
+                    if (hdr.pages[p].slot_idx < 0) {
+                        auto& pg = pages[p];
+                        auto pg_size = static_cast<size_t>(pg.stride) * pg.height;
+                        pipe_write(rfd, pg.data.get(), pg_size);
+                    }
+                }
             }
 
             close(wake_rd);
-            close(result_wr);
+            close(rfd);
             _exit(0);
         }
 
@@ -604,17 +605,14 @@ Pool::Pool(int num_workers, Options opts)
 
 Pool::~Pool() {
     if (!impl_->shared) return;
-
-    // Close wake pipe — workers exit on EOF
     close(impl_->wake_pipe[1]);
     close(impl_->wake_pipe[0]);
-
     for (auto& w : impl_->workers) {
         close(w.result_rd);
         waitpid(w.pid, nullptr, 0);
     }
-
-    munmap(impl_->pixel_buf, impl_->pixel_buf_size);
+    auto page_buf_size = static_cast<size_t>(kNumPageSlots) * kPageSlotSize;
+    munmap(impl_->page_slots, page_buf_size);
     munmap(impl_->job_slots, sizeof(PoolJobSlot) * kMaxPoolJobs);
     munmap(impl_->shared, sizeof(PoolShared));
     FPDF_DestroyLibrary();
@@ -641,16 +639,6 @@ std::optional<PoolResult> Pool::next() {
     if (!impl_->shared) return std::nullopt;
     if (impl_->complete_count >= impl_->submit_count) return std::nullopt;
 
-    // Reset pixel buffer when we've caught up with all completed work.
-    // At this point all pixels from prior results have been copied out by next(),
-    // and no worker is writing (done == complete_count means all finished results
-    // have been read). Workers currently rendering will allocate from offset 0 again.
-    int done_now = impl_->shared->done.load(std::memory_order_acquire);
-    if (done_now > 0 && done_now == impl_->complete_count) {
-        impl_->shared->pixel_alloc.store(0, std::memory_order_release);
-    }
-
-    // Poll all worker result pipes — block until one has data
     auto nw = static_cast<int>(impl_->workers.size());
     std::vector<struct pollfd> pfds(nw);
     for (int i = 0; i < nw; ++i)
@@ -658,38 +646,58 @@ std::optional<PoolResult> Pool::next() {
 
     while (true) {
         int ready = poll(pfds.data(), static_cast<nfds_t>(nw), 5000);
-        if (ready <= 0) continue;  // timeout, retry
+        if (ready <= 0) continue;
 
         for (int i = 0; i < nw; ++i) {
             if (!(pfds[i].revents & POLLIN)) continue;
 
-            // Read full result metadata from this worker
-            PoolResultMeta meta{};
-            auto* p = reinterpret_cast<uint8_t*>(&meta);
-            size_t rem = sizeof(meta);
+            int fd = impl_->workers[i].result_rd;
+
+            PoolResultHdr hdr{};
+            auto* p = reinterpret_cast<uint8_t*>(&hdr);
+            size_t rem = sizeof(hdr);
             while (rem > 0) {
-                auto n = read(impl_->workers[i].result_rd, p, rem);
+                auto n = read(fd, p, rem);
                 if (n <= 0) return std::nullopt;
                 p += n;
                 rem -= n;
             }
 
-            impl_->complete_count++;
+            auto pipe_read = [](int f, void* buf, size_t count) -> bool {
+                auto* p = static_cast<uint8_t*>(buf);
+                while (count > 0) {
+                    auto n = read(f, p, count);
+                    if (n <= 0) return false;
+                    p += n; count -= n;
+                }
+                return true;
+            };
 
-            // Copy pixels out of shared memory
             PoolResult result;
-            result.pdf_path = meta.pdf_path;
-            result.pages.reserve(meta.num_pages);
+            result.pdf_path = hdr.pdf_path;
+            result.pages.reserve(hdr.num_pages);
 
-            for (int j = 0; j < meta.num_pages; ++j) {
-                auto& pm = meta.pages[j];
-                auto pg_size = static_cast<size_t>(pm.stride) * pm.height;
+            for (int j = 0; j < hdr.num_pages; ++j) {
+                auto& pi = hdr.pages[j];
+                auto pg_size = static_cast<size_t>(pi.stride) * pi.height;
                 auto* copy = static_cast<uint8_t*>(std::malloc(pg_size));
                 if (!copy) continue;
-                std::memcpy(copy, impl_->pixel_buf + pm.pixel_offset, pg_size);
-                result.pages.emplace_back(copy, pm.width, pm.height, pm.stride);
+
+                if (pi.slot_idx >= 0) {
+                    // Copy from shared memory, free slot
+                    std::memcpy(copy,
+                                impl_->page_slots + static_cast<size_t>(pi.slot_idx) * kPageSlotSize,
+                                pg_size);
+                    int top = impl_->shared->slot_top.fetch_add(1, std::memory_order_acq_rel);
+                    impl_->shared->slot_stack[top].store(pi.slot_idx, std::memory_order_release);
+                } else {
+                    // Read pixels from pipe
+                    if (!pipe_read(fd, copy, pg_size)) { std::free(copy); break; }
+                }
+                result.pages.emplace_back(copy, pi.width, pi.height, pi.stride);
             }
 
+            impl_->complete_count++;
             return result;
         }
     }
