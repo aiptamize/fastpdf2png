@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "cli/daemon_cmd.h"
+#include "cli/shared_cmd.h"
 #include "internal/pdfium_render.h"
 
 #include <cstdio>
@@ -12,29 +13,6 @@
 #include "fpdfview.h"
 
 namespace fpdf2png::cli {
-
-namespace {
-
-void InitPdfium() {
-    FPDF_LIBRARY_CONFIG config{};
-    config.version = 2;
-    FPDF_InitLibraryWithConfig(&config);
-}
-
-int SplitTabs(char* line, char** tokens, int max_tokens) {
-    int count = 0;
-    auto* p = line;
-    while (count < max_tokens) {
-        tokens[count++] = p;
-        auto* tab = std::strchr(p, '\t');
-        if (!tab) break;
-        *tab = '\0';
-        p = tab + 1;
-    }
-    return count;
-}
-
-} // anonymous namespace
 
 int RunDaemon() {
     InitPdfium();

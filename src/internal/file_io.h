@@ -24,6 +24,10 @@ bool WriteFull(int fd, const void* buf, size_t count);
 
 #ifdef _WIN32
 uint8_t* ReadFileToMemoryWin(const char* path, size_t& out_size);
+
+// HANDLE = void* on Windows; using void* here to avoid including windows.h.
+bool ReadFullWin(void* h, void* buf, unsigned long count);
+bool WriteFullWin(void* h, const void* buf, unsigned long count);
 #endif
 
 } // namespace fpdf2png::internal

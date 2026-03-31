@@ -126,6 +126,30 @@ uint8_t* ReadFileToMemoryWin(const char* path, size_t& out_size) {
     return buf;
 }
 
+bool ReadFullWin(void* h, void* buf, unsigned long count) {
+    auto* p = static_cast<uint8_t*>(buf);
+    DWORD remaining = count;
+    while (remaining > 0) {
+        DWORD n = 0;
+        if (!::ReadFile(static_cast<HANDLE>(h), p, remaining, &n, nullptr) || n == 0) return false;
+        p += n;
+        remaining -= n;
+    }
+    return true;
+}
+
+bool WriteFullWin(void* h, const void* buf, unsigned long count) {
+    auto* p = static_cast<const uint8_t*>(buf);
+    DWORD remaining = count;
+    while (remaining > 0) {
+        DWORD n = 0;
+        if (!::WriteFile(static_cast<HANDLE>(h), p, remaining, &n, nullptr) || n == 0) return false;
+        p += n;
+        remaining -= n;
+    }
+    return true;
+}
+
 #endif // _WIN32
 
 } // namespace fpdf2png::internal

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 #include "cli/raw_cmd.h"
-#include "cli/protocol.h"
+#include "cli/ipc.h"
 #include "internal/file_io.h"
-#include "png/memory_pool.h"
+#include "internal/pdfium_render.h"
+#include "internal/memory_pool.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,15 +21,6 @@
 #include "fpdf_edit.h"
 
 namespace fpdf2png::cli {
-
-namespace {
-
-constexpr float kPointsPerInch = 72.0f;
-constexpr int kNoAA = FPDF_RENDER_NO_SMOOTHTEXT |
-                      FPDF_RENDER_NO_SMOOTHIMAGE |
-                      FPDF_RENDER_NO_SMOOTHPATH;
-
-} // anonymous namespace
 
 int RunRaw(const char* pdf_path, float dpi, bool no_aa) {
 #ifdef _WIN32
@@ -58,7 +50,7 @@ int RunRaw(const char* pdf_path, float dpi, bool no_aa) {
         auto* page = FPDF_LoadPage(doc, i);
         if (!page) continue;
 
-        const auto scale = dpi / kPointsPerInch;
+        const auto scale = dpi / internal::kPointsPerInch;
         const auto w = static_cast<int>(FPDF_GetPageWidth(page) * scale + 0.5f);
         const auto h = static_cast<int>(FPDF_GetPageHeight(page) * scale + 0.5f);
         if (w <= 0 || h <= 0) { FPDF_ClosePage(page); continue; }
@@ -74,7 +66,7 @@ int RunRaw(const char* pdf_path, float dpi, bool no_aa) {
         if (!bitmap) { FPDF_ClosePage(page); continue; }
 
         int flags = FPDF_PRINTING | FPDF_REVERSE_BYTE_ORDER;
-        if (no_aa) flags |= kNoAA;
+        if (no_aa) flags |= internal::kNoAA;
         FPDFBitmap_FillRect(bitmap, 0, 0, w, h, 0xFFFFFFFF);
         FPDF_RenderPageBitmap(bitmap, page, 0, 0, w, h, 0, flags);
         FPDFBitmap_Destroy(bitmap);

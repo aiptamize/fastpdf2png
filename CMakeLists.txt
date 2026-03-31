@@ -56,7 +56,6 @@ set(_lib_sources
     src/lib/c_api.cpp
     src/internal/pdfium_render.cpp
     src/internal/file_io.cpp
-    src/internal/shared_memory.cpp
     src/png/png_writer.cpp
 )
 
@@ -117,11 +116,18 @@ if(FP2P_BUILD_CLI)
         src/cli/args.cpp
         src/cli/render_cmd.cpp
         src/cli/daemon_cmd.cpp
-        src/cli/pool_cmd.cpp
         src/cli/raw_cmd.cpp
     )
     if(WIN32)
-        list(APPEND _cli_sources src/cli/platform/worker_win.cpp)
+        list(APPEND _cli_sources
+            src/cli/platform/render_win.cpp
+            src/cli/platform/pool_win.cpp
+        )
+    else()
+        list(APPEND _cli_sources
+            src/cli/platform/render_unix.cpp
+            src/cli/platform/pool_unix.cpp
+        )
     endif()
 
     # On Windows, internal symbols are not exported from the DLL, so the CLI
@@ -130,7 +136,6 @@ if(FP2P_BUILD_CLI)
         list(APPEND _cli_sources
             src/internal/pdfium_render.cpp
             src/internal/file_io.cpp
-            src/internal/shared_memory.cpp
             src/png/png_writer.cpp
         )
     endif()

@@ -7,11 +7,19 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
 namespace fpdf2png::internal {
 
 #ifndef _WIN32
 /// Allocate anonymous shared memory (MAP_SHARED | MAP_ANONYMOUS).
-void* MmapShared(size_t size);
+inline void* MmapShared(size_t size) {
+    auto* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    return (p == MAP_FAILED) ? nullptr : p;
+}
 #endif
 
 /// Cache-line aligned shared state for multi-process rendering.

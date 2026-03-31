@@ -5,6 +5,7 @@
 // delegates to the appropriate command module.
 
 #include "cli/args.h"
+#include "cli/shared_cmd.h"
 #include "cli/render_cmd.h"
 #include "cli/daemon_cmd.h"
 #include "cli/pool_cmd.h"
@@ -15,15 +16,9 @@
 
 #include "fpdfview.h"
 
-namespace {
-
-void InitPdfium() {
-    FPDF_LIBRARY_CONFIG config{};
-    config.version = 2;
-    FPDF_InitLibraryWithConfig(&config);
-}
-
-} // anonymous namespace
+#ifdef _WIN32
+#include "cli/platform/render_platform.h"
+#endif
 
 int main(int argc, char* argv[]) {
     using namespace fpdf2png::cli;

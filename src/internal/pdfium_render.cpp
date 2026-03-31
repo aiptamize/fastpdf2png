@@ -3,7 +3,7 @@
 
 #include "internal/pdfium_render.h"
 #include "png/png_writer.h"
-#include "png/memory_pool.h"
+#include "internal/memory_pool.h"
 
 #include <cstdio>
 #include <cstdlib>
