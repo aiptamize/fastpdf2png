@@ -15,15 +15,36 @@ fp2p_apply_simd(test_png_writer)
 
 # Integration tests (need a PDF fixture)
 add_executable(test_roundtrip integration/test_roundtrip.cpp)
-target_link_libraries(test_roundtrip PRIVATE GTest::gtest_main fastpdf2png_lib)
+target_link_libraries(test_roundtrip PRIVATE GTest::gtest_main fastpdf2png_lib PDFium::PDFium)
 target_include_directories(test_roundtrip PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party/stb)
 
 add_executable(test_production integration/test_production.cpp)
 target_link_libraries(test_production PRIVATE GTest::gtest_main fastpdf2png_lib)
 target_include_directories(test_production PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party/stb)
 
+# Set RPATH so test binaries find libpdfium and libfastpdf2png
+if(APPLE)
+    set_target_properties(test_png_writer test_roundtrip test_production PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR};${PDFium_LIBRARY_DIR}"
+    )
+elseif(UNIX)
+    set_target_properties(test_png_writer test_roundtrip test_production PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR}:${PDFium_LIBRARY_DIR}"
+    )
+endif()
+
+# Copy PDFium next to test binaries for discovery
+add_custom_command(TARGET test_png_writer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PDFium_LIBRARY}" "${CMAKE_CURRENT_BINARY_DIR}/"
+    COMMENT "Copying PDFium for tests"
+)
+
 include(GoogleTest)
-gtest_discover_tests(test_png_writer)
+gtest_discover_tests(test_png_writer
+    DISCOVERY_TIMEOUT 10
+    PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}:${PDFium_LIBRARY_DIR}"
+)
 
 # Only discover integration tests if fixture exists
 if(EXISTS "${CMAKE_SOURCE_DIR}/bench_sample.pdf")
