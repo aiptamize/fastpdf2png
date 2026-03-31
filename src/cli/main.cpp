@@ -11,6 +11,7 @@
 #include "cli/raw_cmd.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "fpdfview.h"
 
