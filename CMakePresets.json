@@ -84,7 +84,8 @@
       "architecture": { "value": "x64", "strategy": "set" },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "FP2P_BUILD_TESTS": "ON"
+        "FP2P_BUILD_TESTS": "OFF",
+        "FP2P_NATIVE_ARCH": "OFF"
       }
     }
   ],

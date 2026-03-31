@@ -23,6 +23,9 @@ case "$OS" in
             *) echo "Unsupported arch: $ARCH"; exit 1 ;;
         esac
         ;;
+    mingw*|msys*|cygwin*)
+        PLATFORM="win-x64"
+        ;;
     *)
         echo "Unsupported OS: $OS"
         exit 1
@@ -65,14 +68,18 @@ fi
 # Check if it's a valid archive
 if ! tar tzf pdfium.tgz >/dev/null 2>&1; then
     echo "Downloaded file is not a valid archive"
-    echo "Content: $(head -c 100 pdfium.tgz)"
     rm -f pdfium.tgz
     exit 1
 fi
 
 echo "Extracting..."
 tar xzf pdfium.tgz
-rm pdfium.tgz
+rm -f pdfium.tgz
+
+# On Windows, the library may be in bin/ instead of lib/
+if [ -f "$ROOT_DIR/pdfium/bin/pdfium.dll" ] && [ ! -f "$ROOT_DIR/pdfium/lib/pdfium.dll" ]; then
+    cp "$ROOT_DIR/pdfium/bin/pdfium.dll" "$ROOT_DIR/pdfium/lib/" 2>/dev/null || true
+fi
 
 echo ""
 echo "=== PDFium downloaded ==="
