@@ -55,6 +55,12 @@ jobs:
         shell: bash
         run: cmake --build build --config Release --parallel
 
+      - name: Copy pdfium DLL next to binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp pdfium/bin/pdfium.dll build/Release/ 2>/dev/null || true
+
       - name: Download test PDFs
         shell: bash
         run: |
