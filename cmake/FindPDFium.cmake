@@ -25,9 +25,10 @@ endif()
 
 # Find the library
 if(WIN32)
-    # On Windows, link against the import library (.dll.lib or .lib), NOT the DLL
-    find_library(PDFium_LIBRARY
-        NAMES pdfium.dll.lib pdfium.lib pdfium
+    # On Windows, link against the import library (.dll.lib), NOT the DLL itself.
+    # Use find_file (not find_library) to avoid CMake finding pdfium.dll by mistake.
+    find_file(PDFium_LIBRARY
+        NAMES pdfium.dll.lib pdfium.lib
         PATHS "${PDFium_DIR}/lib"
         NO_DEFAULT_PATH
     )
