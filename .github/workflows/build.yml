@@ -276,16 +276,21 @@ jobs:
 
       - name: Install Python package (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          pip install artifacts/*.whl 2>/dev/null || pip install artifacts/*$(uname -m)*.whl
-          pip install Pillow
+          echo "=== artifacts/ ==="
+          find artifacts/ -name "*.whl" -type f 2>/dev/null || echo "no wheels found"
+          WHL=$(find artifacts/ -name "*.whl" -type f | head -1)
+          pip install "$WHL" Pillow
 
       - name: Install Python package (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          pip install artifacts/*win_amd64*.whl
-          pip install Pillow
+          echo "=== artifacts/ ==="
+          find artifacts/ -name "*.whl" -type f 2>/dev/null || echo "no wheels found"
+          WHL=$(find artifacts/ -name "*.whl" -type f | head -1)
+          pip install "$WHL" Pillow
 
       - name: Python tests
         shell: bash
