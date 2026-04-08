@@ -63,8 +63,8 @@ int RunDaemon() {
 
             int rc;
             if (workers > 1 && pages > 1)
-                rc = RenderMulti(pdf, dpi, pat, pages,
-                                 std::min(workers, pages), comp, false);
+                const auto nw = (workers < pages) ? workers : pages;
+                rc = RenderMulti(pdf, dpi, pat, pages, nw, comp, false);
             else
                 rc = RenderSingle(pdf, dpi, pat, pages, comp, false);
 
