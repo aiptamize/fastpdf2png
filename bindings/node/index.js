@@ -43,7 +43,18 @@ function findBinary() {
 }
 
 const BINARY = findBinary();
+const BINARY_DIR = path.dirname(BINARY);
 const MAX_WORKERS = Math.min(4, os.cpus().length || 1);
+
+// Ensure shared libs next to binary are found at runtime
+const LIB_ENV = Object.assign({}, process.env);
+if (os.platform() === "darwin") {
+  LIB_ENV.DYLD_LIBRARY_PATH = [BINARY_DIR, LIB_ENV.DYLD_LIBRARY_PATH].filter(Boolean).join(":");
+} else if (os.platform() === "linux") {
+  LIB_ENV.LD_LIBRARY_PATH = [BINARY_DIR, LIB_ENV.LD_LIBRARY_PATH].filter(Boolean).join(":");
+} else {
+  LIB_ENV.PATH = [BINARY_DIR, LIB_ENV.PATH].filter(Boolean).join(";");
+}
 
 /**
  * Get the number of pages in a PDF (instant, no rendering).
@@ -53,6 +64,7 @@ const MAX_WORKERS = Math.min(4, os.cpus().length || 1);
 function pageCount(pdfPath) {
   const out = execFileSync(BINARY, ["--info", path.resolve(pdfPath)], {
     encoding: "utf-8",
+    env: LIB_ENV,
   });
   return parseInt(out.trim(), 10);
 }
@@ -77,7 +89,7 @@ function toFiles(pdfPath, outputDir, options = {}) {
     path.resolve(pdfPath), pattern,
     String(dpi), String(workers),
     "-c", String(compression),
-  ]);
+  ], { env: LIB_ENV });
 
   return fs.readdirSync(outputDir)
     .filter((f) => f.startsWith(prefix) && f.endsWith(".png"))
@@ -115,6 +127,7 @@ class Engine {
   constructor() {
     this._proc = spawn(BINARY, ["--daemon"], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: LIB_ENV,
     });
     this._stdout = "";
     this._queue = [];  // FIFO queue of { resolve, reject } pairs
