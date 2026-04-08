@@ -267,29 +267,19 @@ jobs:
 
       # --- Python tests ---
 
-      - name: Download wheel artifacts
+      - name: Download wheel artifact (own platform only)
         uses: actions/download-artifact@v4
         with:
+          name: wheel-${{ matrix.os }}
           path: artifacts
-          pattern: wheel-*
-          merge-multiple: true
 
-      - name: Install Python package (Unix)
-        if: runner.os != 'Windows'
+      - name: Install Python package
         shell: bash
         run: |
           echo "=== artifacts/ ==="
-          find artifacts/ -name "*.whl" -type f 2>/dev/null || echo "no wheels found"
+          ls -la artifacts/
           WHL=$(find artifacts/ -name "*.whl" -type f | head -1)
-          pip install "$WHL" Pillow
-
-      - name: Install Python package (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo "=== artifacts/ ==="
-          find artifacts/ -name "*.whl" -type f 2>/dev/null || echo "no wheels found"
-          WHL=$(find artifacts/ -name "*.whl" -type f | head -1)
+          echo "Installing: $WHL"
           pip install "$WHL" Pillow
 
       - name: Python tests
