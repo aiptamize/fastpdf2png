@@ -62,11 +62,12 @@ int RunDaemon() {
             FPDF_CloseDocument(doc);
 
             int rc;
-            if (workers > 1 && pages > 1)
+            if (workers > 1 && pages > 1) {
                 const auto nw = (workers < pages) ? workers : pages;
                 rc = RenderMulti(pdf, dpi, pat, pages, nw, comp, false);
-            else
+            } else {
                 rc = RenderSingle(pdf, dpi, pat, pages, comp, false);
+            }
 
             if (rc != 0)
                 std::printf("ERROR render failed for %s\n", pdf);
