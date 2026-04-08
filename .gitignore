@@ -45,3 +45,4 @@ node_modules/
 
 # Benchmark data
 bench_sample.pdf
+bindings/python/fastpdf2png/bin/
