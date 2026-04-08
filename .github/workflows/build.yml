@@ -66,8 +66,8 @@ jobs:
           mkdir -p bindings/python/fastpdf2png/bin
           cp build/fastpdf2png bindings/python/fastpdf2png/bin/
           chmod +x bindings/python/fastpdf2png/bin/fastpdf2png
-          for lib in build/libpdfium.so build/libpdfium.dylib; do
-            [ -f "$lib" ] && cp "$lib" bindings/python/fastpdf2png/bin/ || true
+          for lib in build/libpdfium.so build/libpdfium.dylib build/libfastpdf2png.*; do
+            [ -f "$lib" ] && cp -a "$lib" bindings/python/fastpdf2png/bin/ || true
           done
 
       - name: Bundle binary into Python package (Windows)
@@ -78,6 +78,7 @@ jobs:
           copy build\Release\fastpdf2png.exe bindings\python\fastpdf2png\bin\ 2>nul || copy build\fastpdf2png.exe bindings\python\fastpdf2png\bin\
           if exist build\pdfium.dll copy build\pdfium.dll bindings\python\fastpdf2png\bin\
           if exist build\Release\pdfium.dll copy build\Release\pdfium.dll bindings\python\fastpdf2png\bin\
+          if exist build\Release\fastpdf2png.dll copy build\Release\fastpdf2png.dll bindings\python\fastpdf2png\bin\
 
       - name: Copy VERSION for Python wheel
         shell: bash
@@ -89,17 +90,6 @@ jobs:
           cd bindings/python
           python -m build --wheel
           mv dist/ ../../dist/
-
-      - name: Retag wheel with platform
-        shell: bash
-        run: |
-          cd dist
-          for whl in *.whl; do
-            python -m wheel tags --platform-tag "$WHEEL_PLAT" --remove "$whl"
-          done
-          ls -lh *.whl
-        env:
-          WHEEL_PLAT: ${{ matrix.wheel_plat }}
 
       - name: Upload Python wheel
         uses: actions/upload-artifact@v4
@@ -115,27 +105,22 @@ jobs:
         run: |
           PKG_DIR="npm-platform-pkg"
           mkdir -p "$PKG_DIR"
-
           cp build/fastpdf2png "$PKG_DIR/"
           chmod +x "$PKG_DIR/fastpdf2png"
           for lib in build/libpdfium.so build/libpdfium.dylib build/libfastpdf2png.*; do
             [ -f "$lib" ] && cp -a "$lib" "$PKG_DIR/" || true
           done
-
           cat > "$PKG_DIR/package.json" << PKGJSON
           {
             "name": "@fastpdf2png/${NPM_PLATFORM}-${NPM_ARCH}",
             "version": "2.0.0",
-            "description": "fastpdf2png binary for ${NPM_PLATFORM}-${NPM_ARCH}",
             "os": ["${NPM_PLATFORM}"],
             "cpu": ["${NPM_ARCH}"],
             "license": "MIT",
             "files": ["fastpdf2png", "libpdfium.*", "libfastpdf2png.*"]
           }
           PKGJSON
-
           cd "$PKG_DIR" && npm pack
-          ls -lh *.tgz
         env:
           NPM_PLATFORM: ${{ matrix.npm_platform }}
           NPM_ARCH: ${{ matrix.npm_arch }}
@@ -146,25 +131,21 @@ jobs:
         run: |
           PKG_DIR="npm-platform-pkg"
           mkdir -p "$PKG_DIR"
-
           cp build/Release/fastpdf2png.exe "$PKG_DIR/" 2>/dev/null || cp build/fastpdf2png.exe "$PKG_DIR/"
           for dll in pdfium.dll fastpdf2png.dll; do
             [ -f "build/$dll" ] && cp "build/$dll" "$PKG_DIR/" || true
             [ -f "build/Release/$dll" ] && cp "build/Release/$dll" "$PKG_DIR/" || true
           done
-
           cat > "$PKG_DIR/package.json" << PKGJSON
           {
             "name": "@fastpdf2png/${NPM_PLATFORM}-${NPM_ARCH}",
             "version": "2.0.0",
-            "description": "fastpdf2png binary for ${NPM_PLATFORM}-${NPM_ARCH}",
             "os": ["${NPM_PLATFORM}"],
             "cpu": ["${NPM_ARCH}"],
             "license": "MIT",
             "files": ["fastpdf2png.exe", "pdfium.dll", "fastpdf2png.dll"]
           }
           PKGJSON
-
           cd "$PKG_DIR" && npm pack
         env:
           NPM_PLATFORM: ${{ matrix.npm_platform }}
@@ -178,14 +159,21 @@ jobs:
 
       # --- Upload raw binary ---
 
-      - name: Upload binary artifact
+      - name: Upload binary (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}
+          path: build/fastpdf2png
+
+      - name: Upload binary (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.os }}
           path: |
-            build/fastpdf2png
-            build/fastpdf2png.exe
             build/Release/fastpdf2png.exe
+            build/fastpdf2png.exe
 
   test:
     needs: build
@@ -205,6 +193,79 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      # --- Install native binary FIRST (needed by both Python and Node tests) ---
+
+      - name: Download npm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: npm-artifacts
+          pattern: npm-*
+          merge-multiple: true
+
+      - name: Install native binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p build
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  PLAT="linux-x64" ;;
+            Darwin-arm64)  PLAT="darwin-arm64" ;;
+          esac
+          tar xzf npm-artifacts/*${PLAT}*.tgz -C build --strip-components=1
+          chmod +x build/fastpdf2png
+          # Recreate symlinks dropped by npm pack
+          cd build
+          for lib in libfastpdf2png.so.*.*.* libfastpdf2png.*.dylib; do
+            [ -f "$lib" ] || continue
+            base="${lib%%.*}"
+            ln -sf "$lib" "${base}.so.2" 2>/dev/null || true
+            ln -sf "$lib" "${base}.so" 2>/dev/null || true
+            ln -sf "$lib" "${base}.2.dylib" 2>/dev/null || true
+            ln -sf "$lib" "${base}.dylib" 2>/dev/null || true
+          done
+          cd ..
+          echo "=== build/ contents ==="
+          ls -la build/
+
+      - name: Install native binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p build
+          tar xzf npm-artifacts/*win32-x64*.tgz -C build --strip-components=1
+          # Ensure pdfium.dll is present
+          [ -f build/pdfium.dll ] || cp pdfium/bin/pdfium.dll build/ 2>/dev/null || true
+          [ -f build/pdfium.dll ] || (bash scripts/get_pdfium.sh && cp pdfium/bin/pdfium.dll build/) 2>/dev/null || true
+          echo "=== build/ contents ==="
+          ls -la build/
+
+      # --- Verify binary works directly ---
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
+          export DYLD_LIBRARY_PATH=$PWD/build:$DYLD_LIBRARY_PATH
+          export PATH=$PWD/build:$PATH
+          build/fastpdf2png --info test.pdf 2>/dev/null || build/fastpdf2png.exe --info test.pdf 2>/dev/null || echo "WARN: binary verification skipped (no test.pdf yet)"
+
+      # --- Download test PDF ---
+
+      - name: Download test PDF
+        run: curl -sL -o test.pdf "https://arxiv.org/pdf/2312.10997"
+
+      - name: Verify binary with PDF
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
+          export DYLD_LIBRARY_PATH=$PWD/build:$DYLD_LIBRARY_PATH
+          export PATH=$PWD/build:$PATH
+          PAGES=$(build/fastpdf2png --info test.pdf 2>/dev/null || build/fastpdf2png.exe --info test.pdf 2>/dev/null)
+          echo "Pages: $PAGES"
+          [ "$PAGES" -gt 0 ] || exit 1
+
+      # --- Python tests ---
 
       - name: Download wheel artifacts
         uses: actions/download-artifact@v4
@@ -226,81 +287,63 @@ jobs:
           pip install artifacts/*win_amd64*.whl
           pip install Pillow
 
-      - name: Download test PDF
-        run: curl -sL -o test.pdf "https://arxiv.org/pdf/2312.10997"
-
       - name: Python tests
         shell: bash
         run: |
           pip install pytest
-          # Point to the native binary from the npm package (correct platform)
           if [ -f build/fastpdf2png.exe ]; then
             export FASTPDF2PNG_BIN=$PWD/build/fastpdf2png.exe
           else
             export FASTPDF2PNG_BIN=$PWD/build/fastpdf2png
           fi
           export FASTPDF2PNG_TEST_PDF=$PWD/test.pdf
+          export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
+          export DYLD_LIBRARY_PATH=$PWD/build:$DYLD_LIBRARY_PATH
+          export PATH=$PWD/build:$PATH
+          echo "FASTPDF2PNG_BIN=$FASTPDF2PNG_BIN"
+          ls -la "$FASTPDF2PNG_BIN" || echo "BIN NOT FOUND!"
           cd tests/python
           python -m pytest test_converter.py -v
         env:
           FASTPDF2PNG_TEST_PDF: test.pdf
 
-      - name: Download npm artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: npm-artifacts
-          pattern: npm-*
-          merge-multiple: true
-
-      - name: Install binary for Node.js test (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p build
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64)  PLAT="linux-x64" ;;
-            Darwin-arm64)  PLAT="darwin-arm64" ;;
-          esac
-          tar xzf npm-artifacts/*${PLAT}*.tgz -C build --strip-components=1
-          chmod +x build/fastpdf2png
-          # Recreate symlinks dropped by npm pack
-          cd build
-          for lib in libfastpdf2png.so.*.*.* libfastpdf2png.*.dylib; do
-            [ -f "$lib" ] || continue
-            base="${lib%%.*}"
-            ln -sf "$lib" "${base}.so.2" 2>/dev/null || true
-            ln -sf "$lib" "${base}.so" 2>/dev/null || true
-            ln -sf "$lib" "${base}.2.dylib" 2>/dev/null || true
-            ln -sf "$lib" "${base}.dylib" 2>/dev/null || true
-          done
-          ls -la libfastpdf2png* 2>/dev/null || true
-          cd ..
-
-      - name: Install binary for Node.js test (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p build
-          tar xzf npm-artifacts/*win32-x64*.tgz -C build --strip-components=1
-          # Ensure all DLLs are present
-          [ -f build/pdfium.dll ] || cp pdfium/bin/pdfium.dll build/ 2>/dev/null || true
-          # Download pdfium if not present at all
-          [ -f build/pdfium.dll ] || (bash scripts/get_pdfium.sh && cp pdfium/bin/pdfium.dll build/) 2>/dev/null || true
-          echo "=== build/ contents ===" && ls -la build/
+      # --- Node.js tests ---
 
       - name: Node.js smoke test
         shell: bash
         run: |
-          echo "=== build/ contents ==="
-          ls -la build/
-          echo "=== Testing binary directly ==="
           export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH
           export DYLD_LIBRARY_PATH=$PWD/build:$DYLD_LIBRARY_PATH
           export PATH=$PWD/build:$PATH
-          build/fastpdf2png --info test.pdf || build/fastpdf2png.exe --info test.pdf || echo "Direct binary test FAILED"
-          echo "=== Testing via Node.js ==="
           cd bindings/node
           node -e "
             const pdf = require('./index.js');
             const n = pdf.pageCount(process.cwd() + '/../../test.pdf');
             console.log('Node.js OK: ' + n + ' pages');
           "
+
+  publish:
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find release-artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*.whl
+            release-artifacts/*.tgz
+            release-artifacts/fastpdf2png*
+          generate_release_notes: true
