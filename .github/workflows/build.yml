@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [main, develop]
     tags: ["v*"]
 
 env:
@@ -257,6 +256,18 @@ jobs:
           esac
           tar xzf npm-artifacts/*${PLAT}*.tgz -C build --strip-components=1
           chmod +x build/fastpdf2png
+          # Recreate symlinks dropped by npm pack
+          cd build
+          for lib in libfastpdf2png.so.*.*.* libfastpdf2png.*.dylib; do
+            [ -f "$lib" ] || continue
+            base="${lib%%.*}"
+            ln -sf "$lib" "${base}.so.2" 2>/dev/null || true
+            ln -sf "$lib" "${base}.so" 2>/dev/null || true
+            ln -sf "$lib" "${base}.2.dylib" 2>/dev/null || true
+            ln -sf "$lib" "${base}.dylib" 2>/dev/null || true
+          done
+          ls -la libfastpdf2png* 2>/dev/null || true
+          cd ..
 
       - name: Install binary for Node.js test (Windows)
         if: runner.os == 'Windows'
