@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 #include "cli/daemon_cmd.h"
+#include "cli/args.h"
 #include "cli/shared_cmd.h"
 #include "cli/platform/render_platform.h"
 #include "internal/pdfium_render.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,10 +44,13 @@ int RunDaemon() {
         if (ntok >= 3 && std::string_view{tokens[0]} == "RENDER") {
             const auto* pdf = tokens[1];
             const auto* pat = tokens[2];
-            const auto dpi = (ntok >= 4)
+            auto dpi = (ntok >= 4)
                 ? static_cast<float>(std::atof(tokens[3])) : 150.0f;
-            const auto workers = (ntok >= 5) ? std::atoi(tokens[4]) : 1;
-            const auto comp = (ntok >= 6) ? std::atoi(tokens[5]) : -1;
+            if (dpi <= 0 || dpi > kMaxDpi) dpi = 150.0f;
+            const auto workers = (ntok >= 5)
+                ? std::clamp(std::atoi(tokens[4]), 1, kMaxWorkers) : 1;
+            const auto comp = (ntok >= 6)
+                ? std::clamp(std::atoi(tokens[5]), -1, 2) : -1;
 
             auto* doc = FPDF_LoadDocument(pdf, nullptr);
             if (!doc) {
@@ -56,13 +61,17 @@ int RunDaemon() {
             const auto pages = FPDF_GetPageCount(doc);
             FPDF_CloseDocument(doc);
 
+            int rc;
             if (workers > 1 && pages > 1)
-                RenderMulti(pdf, dpi, pat, pages,
-                            std::min(workers, pages), comp, false);
+                rc = RenderMulti(pdf, dpi, pat, pages,
+                                 std::min(workers, pages), comp, false);
             else
-                RenderSingle(pdf, dpi, pat, pages, comp, false);
+                rc = RenderSingle(pdf, dpi, pat, pages, comp, false);
 
-            std::printf("OK %d\n", pages);
+            if (rc != 0)
+                std::printf("ERROR render failed for %s\n", pdf);
+            else
+                std::printf("OK %d\n", pages);
             std::fflush(stdout);
             continue;
         }

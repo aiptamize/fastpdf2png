@@ -6,16 +6,20 @@
 #include "fastpdf2png/types.h"
 
 #include <cstdlib>
+#include <mutex>
 
 static fpdf2png::Engine* g_engine = nullptr;
+static std::mutex g_engine_mtx;
 
 extern "C" {
 
 void fpdf2png_init(void) {
+    std::lock_guard<std::mutex> lock(g_engine_mtx);
     if (!g_engine) g_engine = new fpdf2png::Engine();
 }
 
 void fpdf2png_shutdown(void) {
+    std::lock_guard<std::mutex> lock(g_engine_mtx);
     delete g_engine;
     g_engine = nullptr;
 }

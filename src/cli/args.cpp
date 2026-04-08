@@ -54,6 +54,10 @@ bool ParseArgs(int argc, char* argv[], ParsedArgs& out) {
             ? static_cast<float>(std::atof(argv[3])) : 150.0f;
         for (int i = 3; i < argc; ++i)
             if (std::string_view{argv[i]} == "--no-aa") out.no_aa = true;
+        if (out.dpi <= 0 || out.dpi > kMaxDpi) {
+            std::fprintf(stderr, "DPI must be 1-%.0f\n", kMaxDpi);
+            return false;
+        }
         return true;
     }
 
@@ -73,6 +77,10 @@ bool ParseArgs(int argc, char* argv[], ParsedArgs& out) {
                 out.compression = std::clamp(std::atoi(argv[i + 1]), -1, 2);
             if (std::string_view{argv[i]} == "--no-aa")
                 out.no_aa = true;
+        }
+        if (out.dpi <= 0 || out.dpi > kMaxDpi) {
+            std::fprintf(stderr, "DPI must be 1-%.0f\n", kMaxDpi);
+            return false;
         }
         out.workers = std::clamp(out.workers, 1, kMaxWorkers);
         return true;

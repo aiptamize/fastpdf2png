@@ -77,7 +77,12 @@ bool RenderPageToFile(FPDF_DOCUMENT doc, int page_idx, float dpi,
     FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, flags);
 
     char path[4096];
-    std::snprintf(path, sizeof(path), pattern, page_idx + 1);
+    const auto path_len = std::snprintf(path, sizeof(path), pattern, page_idx + 1);
+    if (path_len < 0 || static_cast<size_t>(path_len) >= sizeof(path)) {
+        FPDFBitmap_Destroy(bitmap);
+        FPDF_ClosePage(page);
+        return false;
+    }
 
     const auto result = fast_png::WriteRgba(path, buffer, width, height, stride, compression);
     FPDFBitmap_Destroy(bitmap);
