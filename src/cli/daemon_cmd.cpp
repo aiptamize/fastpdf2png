@@ -3,6 +3,7 @@
 
 #include "cli/daemon_cmd.h"
 #include "cli/shared_cmd.h"
+#include "cli/platform/render_platform.h"
 #include "internal/pdfium_render.h"
 
 #include <cstdio>
@@ -43,7 +44,8 @@ int RunDaemon() {
             const auto* pat = tokens[2];
             const auto dpi = (ntok >= 4)
                 ? static_cast<float>(std::atof(tokens[3])) : 150.0f;
-            const auto comp = (ntok >= 6) ? std::atoi(tokens[5]) : 2;
+            const auto workers = (ntok >= 5) ? std::atoi(tokens[4]) : 1;
+            const auto comp = (ntok >= 6) ? std::atoi(tokens[5]) : -1;
 
             auto* doc = FPDF_LoadDocument(pdf, nullptr);
             if (!doc) {
@@ -52,10 +54,13 @@ int RunDaemon() {
                 continue;
             }
             const auto pages = FPDF_GetPageCount(doc);
-
-            for (int i = 0; i < pages; ++i)
-                internal::RenderPageToFile(doc, i, dpi, pat, comp);
             FPDF_CloseDocument(doc);
+
+            if (workers > 1 && pages > 1)
+                RenderMulti(pdf, dpi, pat, pages,
+                            std::min(workers, pages), comp, false);
+            else
+                RenderSingle(pdf, dpi, pat, pages, comp, false);
 
             std::printf("OK %d\n", pages);
             std::fflush(stdout);
