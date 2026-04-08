@@ -80,6 +80,10 @@ jobs:
           if exist build\pdfium.dll copy build\pdfium.dll bindings\python\fastpdf2png\bin\
           if exist build\Release\pdfium.dll copy build\Release\pdfium.dll bindings\python\fastpdf2png\bin\
 
+      - name: Copy VERSION for Python wheel
+        shell: bash
+        run: cp VERSION bindings/python/VERSION
+
       - name: Build Python wheel
         run: |
           pip install build wheel

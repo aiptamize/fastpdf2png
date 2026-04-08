@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastpdf2png"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Ultra-fast PDF to PNG converter"
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,9 @@ Issues = "https://github.com/nataell95/fastpdf2png/issues"
 
 [project.optional-dependencies]
 pil = ["Pillow"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
 
 [tool.setuptools.packages.find]
 include = ["fastpdf2png*"]
