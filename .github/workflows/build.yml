@@ -275,6 +275,9 @@ jobs:
         run: |
           mkdir -p build
           tar xzf npm-artifacts/*win32-x64*.tgz -C build --strip-components=1
+          echo "=== build/ contents ===" && ls -la build/
+          # Ensure pdfium.dll is present (may have been built but not packaged)
+          [ -f build/pdfium.dll ] || cp pdfium/bin/pdfium.dll build/ 2>/dev/null || true
 
       - name: Node.js smoke test
         shell: bash
